@@ -21,8 +21,27 @@
 //  malloc/free pair, while guest apps keep using their own custom allocators
 //  through direct (strong, self) bindings — nobody is broken.
 //
+//  Follow-up crash (2nd bug, Black Russia + injected tweak dylibs):
+//  guest *tweak* dylibs (Documents/Tweaks/*.dylib, loaded by TweakLoader)
+//  import operator new/delete as WEAK symbols. With the shims above in place
+//  those weak imports bind to the shim pair (plain malloc/free, no headers),
+//  while the guest engine's own operators are its custom header-based pair
+//  (blackrussia-client: 16-byte header, delete == free(*(p-0x10)), mode is
+//  picked by a __builtin_available check). A buffer created on the tweak side
+//  and destroyed by the engine then goes through the engine's header-aware
+//  delete with a non-header pointer → free(garbage) →
+//  "pointer being freed was not allocated" → SIGABRT in the engine's
+//  MainThread (SetGetSerializedSettingsCallback settings pipeline).
+//
+//  Mitigation: interpose free() from the main executable with a guard that
+//  silently ignores frees of pointers which are NOT the start of a live
+//  malloc allocation (exactly the condition libmalloc aborts on). Valid frees
+//  are forwarded unchanged, so behavior is identical except that allocator
+//  mismatches turn into a small leak instead of a crash.
+//
 
 #include <cstdlib>
+#include <malloc/malloc.h>
 #include <new>
 #include <stddef.h>
 
@@ -70,6 +89,30 @@ static inline void* lc_alloc_aligned_nothrow(std::size_t size, std::size_t align
 
 #define LC_SHIM_EXPORT __attribute__((used, visibility("default")))
 
+// free() with an allocator-mismatch guard: ignores pointers that are not the
+// start of a live malloc allocation (wild pointers AND interior pointers).
+// malloc_size()/malloc_zone_from_ptr()/malloc_zone_free() are pure libmalloc
+// queries/entries that are NOT interposed here, so there is no recursion and
+// no lazy-initialization reentry risk.
+static inline void lc_free_guarded(void* p) {
+    if (!p) return;
+    if (malloc_size(p) == 0) return; // not a live allocation start: ignore
+    malloc_zone_t* zone = malloc_zone_from_ptr(p);
+    malloc_zone_free(zone ? zone : malloc_default_zone(), p);
+}
+
+// Interposed free(): identical to free() except that pointers which are not
+// the start of a live malloc allocation are silently ignored (leak) instead
+// of aborting with "pointer being freed was not allocated".
+static void lc_interposed_free(void* p) { lc_free_guarded(p); }
+
+struct lc_interpose_pair { const void* replacement; const void* replacee; };
+__attribute__((used)) static const struct lc_interpose_pair lc_free_interposer
+    __attribute__((section("__DATA,__interpose"), used)) = {
+        (const void*)&lc_interposed_free,
+        (const void*)&free,
+    };
+
 // --- operator new (throwing) ---
 LC_SHIM_EXPORT void* operator new(std::size_t size) { return lc_alloc(size); }
 LC_SHIM_EXPORT void* operator new[](std::size_t size) { return lc_alloc(size); }
@@ -81,15 +124,15 @@ LC_SHIM_EXPORT void* operator new(std::size_t size, std::align_val_t al, const s
 LC_SHIM_EXPORT void* operator new[](std::size_t size, std::align_val_t al, const std::nothrow_t&) noexcept { return lc_alloc_aligned_nothrow(size, (std::size_t)al); }
 
 // --- operator delete ---
-LC_SHIM_EXPORT void operator delete(void* p) noexcept { free(p); }
-LC_SHIM_EXPORT void operator delete[](void* p) noexcept { free(p); }
-LC_SHIM_EXPORT void operator delete(void* p, std::size_t) noexcept { free(p); }
-LC_SHIM_EXPORT void operator delete[](void* p, std::size_t) noexcept { free(p); }
-LC_SHIM_EXPORT void operator delete(void* p, const std::nothrow_t&) noexcept { free(p); }
-LC_SHIM_EXPORT void operator delete[](void* p, const std::nothrow_t&) noexcept { free(p); }
-LC_SHIM_EXPORT void operator delete(void* p, std::align_val_t) noexcept { free(p); }
-LC_SHIM_EXPORT void operator delete[](void* p, std::align_val_t) noexcept { free(p); }
-LC_SHIM_EXPORT void operator delete(void* p, std::size_t, std::align_val_t) noexcept { free(p); }
-LC_SHIM_EXPORT void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { free(p); }
-LC_SHIM_EXPORT void operator delete(void* p, std::align_val_t, const std::nothrow_t&) noexcept { free(p); }
-LC_SHIM_EXPORT void operator delete[](void* p, std::align_val_t, const std::nothrow_t&) noexcept { free(p); }
+LC_SHIM_EXPORT void operator delete(void* p) noexcept { lc_free_guarded(p); }
+LC_SHIM_EXPORT void operator delete[](void* p) noexcept { lc_free_guarded(p); }
+LC_SHIM_EXPORT void operator delete(void* p, std::size_t) noexcept { lc_free_guarded(p); }
+LC_SHIM_EXPORT void operator delete[](void* p, std::size_t) noexcept { lc_free_guarded(p); }
+LC_SHIM_EXPORT void operator delete(void* p, const std::nothrow_t&) noexcept { lc_free_guarded(p); }
+LC_SHIM_EXPORT void operator delete[](void* p, const std::nothrow_t&) noexcept { lc_free_guarded(p); }
+LC_SHIM_EXPORT void operator delete(void* p, std::align_val_t) noexcept { lc_free_guarded(p); }
+LC_SHIM_EXPORT void operator delete[](void* p, std::align_val_t) noexcept { lc_free_guarded(p); }
+LC_SHIM_EXPORT void operator delete(void* p, std::size_t, std::align_val_t) noexcept { lc_free_guarded(p); }
+LC_SHIM_EXPORT void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { lc_free_guarded(p); }
+LC_SHIM_EXPORT void operator delete(void* p, std::align_val_t, const std::nothrow_t&) noexcept { lc_free_guarded(p); }
+LC_SHIM_EXPORT void operator delete[](void* p, std::align_val_t, const std::nothrow_t&) noexcept { lc_free_guarded(p); }
