@@ -14,6 +14,8 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <stdlib.h>
+#include <string.h>
+#include <malloc/malloc.h>
 #include "../litehook/src/litehook.h"
 #import "Tweaks/Tweaks.h"
 #include <mach-o/ldsyms.h>
@@ -247,6 +249,174 @@ static void *getAppEntryPoint(void *handle) {
     assert(entryoff > 0);
     return (void *)header + entryoff;
 }
+
+// --- Guest allocator-mode guard (crashes #2-#6, Black Russia) ---------------
+//
+// Crash #6 (build 8af6ca3) proved that the availability_version_check rebind
+// added to TweakLoader can never work, for two independent reasons:
+//
+// 1. TIMING: TweakLoader is injected as the guest executable's LAST
+//    LC_LOAD_DYLIB, so its constructor runs after every guest initializer.
+//    The engine's allocator mode is decided lazily at the first allocation,
+//    which happens inside guest static initializers - before TweakLoader
+//    even gets a chance to register its rebind.
+//
+// 2. EMPTY INDIRECT SYMBOL TABLE: modern chained-fixups guest binaries have
+//    dysymtab->nindirectsyms == 0 (verified for blackrussia-client:
+//    indirectsymoff=0x0, nindirectsyms=0), so the vendored fishhook returns
+//    immediately and rebinds NOTHING, silently.
+//
+// Fix, installed here in LiveContainerShared BEFORE the guest dlopen:
+//   - dyld fires add-image handlers for a dlopen'ed image after its fixups
+//     and before any of its initializers, giving us a pre-init window;
+//   - instead of symbol tables, GOT slots are matched by their RESOLVED
+//     value: at add-image time every non-lazy GOT slot already holds the
+//     final address, which equals dlsym(symbol), regardless of chained
+//     fixups;
+//   - availability_version_check in guest images is redirected to a stub
+//     returning 0 ("requirement not met"). On a normal install the guest IS
+//     the main executable, so a request beyond its own SDK legitimately
+//     fails; under LiveContainer the answer would be based on LiveContainer's
+//     fresh SDK instead. Returning 0 puts guests on their legacy,
+//     battle-tested code paths - for Black Russia's engine that is the plain
+//     malloc/free allocator (mode 1) instead of the 16-byte-header pool
+//     (mode 0) whose buffers abort when shared-cache libc++ std::string code
+//     frees them ("pointer being freed was not allocated");
+//   - additionally the engine's allocator mode byte is forced directly for
+//     the exact game binary seen in every crash report (gated by UUID and
+//     function-prologue signatures), so the fix does not depend on the
+//     availability path at all.
+
+static int LCLegacyAvailabilityCheck(uint32_t count, void *versions) {
+    return 0;
+}
+
+static void LCGuardedFreeEarly(void *p) {
+    if (!p) return;
+    if (malloc_size(p) == 0) return; // not a live allocation start: leak instead of abort
+    malloc_zone_t *zone = malloc_zone_from_ptr(p);
+    malloc_zone_free(zone ? zone : malloc_default_zone(), p);
+}
+
+static void LCGuardedZoneFreeEarly(malloc_zone_t *zone, void *p) {
+    if (!p) return;
+    if (malloc_size(p) == 0) return;
+    malloc_zone_free(zone ? zone : malloc_default_zone(), p);
+}
+
+// Overwrite every GOT slot of the image whose resolved value equals
+// dlsym(symbolName) with replacement. Needs no symbol tables, therefore
+// works for chained-fixups binaries where fishhook's classic pass no-ops.
+void LCOverwriteGotSlotsInImage(const struct mach_header *mh, intptr_t slide,
+                                const char *symbolName, void *replacement) {
+    if (mh->magic != MH_MAGIC_64) return;
+    void *target = dlsym(RTLD_DEFAULT, symbolName);
+    if (!target) return;
+    const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cursor;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cursor;
+            const struct section_64 *sections = (const struct section_64 *)(cursor + sizeof(struct segment_command_64));
+            for (uint32_t s = 0; s < seg->nsects; s++) {
+                const struct section_64 *sect = &sections[s];
+                uint8_t type = sect->flags & SECTION_TYPE;
+                if (type != S_NON_LAZY_SYMBOL_POINTERS && type != S_LAZY_SYMBOL_POINTERS) continue;
+                if (sect->size == 0 || sect->size > 0x100000) continue;
+                void **slots = (void **)(uintptr_t)(sect->addr + slide);
+                kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)(uintptr_t)slots,
+                                              (vm_size_t)sect->size, 0,
+                                              VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                if (kr != KERN_SUCCESS) continue;
+                for (uintptr_t k = 0; k < sect->size / sizeof(void *); k++) {
+                    if (slots[k] == target) {
+                        slots[k] = replacement;
+                    }
+                }
+            }
+        }
+        cursor += lc->cmdsize;
+    }
+}
+
+// Belt-and-suspenders backup pinned to the exact game binary from crash
+// reports #2-#6. Disassembly of blackrussia-client
+// (UUID 855846c3-4f72-3770-b811-dd7fbe68b0db):
+//   operator new @0xF1200 / operator delete @0xF1060 both do:
+//     ldarb w8, [0x1B0C5D8]   ; Itanium __cxa_guard
+//     tbz   w8, #0, ...       ; bit0 == 0 -> run lazy config ctor
+//     ldrb  w8, [0x1B0C599]   ; allocator mode
+//     cmp   w8, #1            ; mode 1 -> plain malloc/free
+//     b.ne  pool path         ; else -> malloc(size+0x10) header pool
+// Pre-initializing the guard (bit0 = "done") and the mode byte (1) skips the
+// lazy ctor entirely and makes the engine allocate exactly like on a stock
+// install with an old SDK.
+#define LC_BR_UUID_HEX "855846c34f723770b811dd7fbe68b0db"
+static const uint8_t LC_BR_Znwm_SIG[16] = {
+    0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9,
+    0xfd, 0x43, 0x00, 0x91, 0xf3, 0x03, 0x00, 0xaa };
+static const uint8_t LC_BR_ZdlPv_SIG[16] = {
+    0xff, 0x83, 0x00, 0xd1, 0xfd, 0x7b, 0x01, 0xa9,
+    0xfd, 0x43, 0x00, 0x91, 0xc8, 0xd0, 0x00, 0xf0 };
+
+static void LCForceBlackRussiaLegacyAllocator(const struct mach_header *mh, intptr_t slide) {
+    if (mh->magic != MH_MAGIC_64) return;
+    bool uuidOk = false;
+    const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cursor;
+        if (lc->cmd == LC_UUID) {
+            static const char digits[] = "0123456789abcdef";
+            char hex[33];
+            const uint8_t *u = cursor + sizeof(struct load_command);
+            for (int b = 0; b < 16; b++) {
+                hex[b * 2] = digits[u[b] >> 4];
+                hex[b * 2 + 1] = digits[u[b] & 0xf];
+            }
+            hex[32] = '\0';
+            uuidOk = strcmp(hex, LC_BR_UUID_HEX) == 0;
+            break;
+        }
+        cursor += lc->cmdsize;
+    }
+    if (!uuidOk) return;
+    // Prologue signatures pin the offsets; anything else -> do nothing.
+    if (memcmp((const void *)(uintptr_t)(slide + 0xF1200), LC_BR_Znwm_SIG, sizeof(LC_BR_Znwm_SIG)) != 0) return;
+    if (memcmp((const void *)(uintptr_t)(slide + 0xF1060), LC_BR_ZdlPv_SIG, sizeof(LC_BR_ZdlPv_SIG)) != 0) return;
+    volatile uint64_t *guard = (volatile uint64_t *)(uintptr_t)(slide + 0x1B0C5D8);
+    volatile uint8_t *mode = (volatile uint8_t *)(uintptr_t)(slide + 0x1B0C599);
+    if (*guard != 0) return; // lazy ctor already ran (not expected pre-init)
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)((uintptr_t)guard & ~0xfffULL),
+                                  0x4000, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) return;
+    *guard = 1; // __cxa_guard_acquire now returns 0: the lazy ctor never runs
+    *mode = 1;  // plain malloc/free allocator, identical to stock
+    NSLog(@"[LC] blackrussia-client allocator mode forced to legacy malloc/free (pre-init)");
+}
+
+static void LCGuardGuestImageEarly(const struct mach_header *mh, intptr_t slide) {
+    Dl_info info;
+    if (!dladdr((const void *)mh, &info) || !info.dli_fname) return;
+    const char *path = info.dli_fname;
+    // Only patch guest app images and tweaks; LC's own images keep real answers.
+    if (!strstr(path, "/Documents/Applications/") && !strstr(path, "/Documents/Tweaks/")) return;
+    LCOverwriteGotSlotsInImage(mh, slide, "availability_version_check", (void *)LCLegacyAvailabilityCheck);
+    LCOverwriteGotSlotsInImage(mh, slide, "free", (void *)LCGuardedFreeEarly);
+    LCOverwriteGotSlotsInImage(mh, slide, "malloc_zone_free", (void *)LCGuardedZoneFreeEarly);
+    LCForceBlackRussiaLegacyAllocator(mh, slide);
+    NSLog(@"[LC] guest image guarded pre-init: %s", path);
+}
+
+static void LCInstallGuestAllocatorGuard(void) {
+    static bool installed = false;
+    if (installed) return;
+    installed = true;
+    // Fires immediately for all images loaded so far (LC's own - filtered out
+    // by path) and for every image added later, before its initializers run.
+    _dyld_register_func_for_add_image(LCGuardGuestImageEarly);
+    NSLog(@"[LC] guest allocator guard registered");
+}
+// ---------------------------------------------------------------------------
 
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
     NSString *appError = nil;
@@ -567,6 +737,10 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         tweakLoaderLoaded = true;
     }
     
+    // Install the guest allocator guard BEFORE the guest dlopen: dyld fires
+    // add-image handlers for every guest image before its initializers run.
+    LCInstallGuestAllocatorGuard();
+
     // Preload executable to bypass RT_NOLOAD
     appMainImageIndex = _dyld_image_count();
     __block void *appHandle = 0;
