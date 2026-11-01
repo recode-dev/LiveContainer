@@ -13,53 +13,33 @@
 //  with another, which aborts at launch with:
 //      malloc: *** error for object ...: pointer being freed was not allocated
 //      → SIGABRT inside protobuf_AddDesc_... (libprotobuf initializer)
-//  Mitigation: strong malloc/free-based operator family in the *main
+//  Mitigation: a strong malloc/free-based operator family in the *main
 //  executable*. The main executable is always the FIRST entry of dyld's
 //  coalescing scan list, so every weak operator lookup from system libraries
 //  (and from tweak dylibs) resolves to this pair. operator_shims.exp +
 //  -Wl,-exported_symbols_list keep the definitions alive and exported.
 //
-//  Fix #3 (heap crash in guest MainThread / RakNet pipeline, "pointer being
-//  freed was not allocated" inside blackrussia-client `operator delete(void*)`
-//  at +88): the engine's allocator is FORMAT-INCOMPATIBLE with plain malloc.
-//  Disassembly of the on-device build (symtab: __ZdlPv=0xf1060, __Znwm=0xf1200):
+//  WHY THE SHIM ALLOCATIONS MUST BE PLAIN MALLOC (crash #4): the shim's weak
+//  clients include guest frameworks whose std::string buffers end up freed by
+//  the out-of-line std::string code INSIDE the shared-cache libc++.1.dylib.
+//  libc++'s operator delete is a *strong two-level bind prebound inside the
+//  shared cache* (libc++ → libc++abi) — it cannot be coalesced, interposed or
+//  redirected, and it requires p to be a plain malloc block start. Any
+//  interior-pointer format (e.g. the guest engine's 16-byte header layout)
+//  aborts there with "pointer being freed was not allocated" — observed in
+//  std::string::__grow_by_and_replace ← UpdateManagerSystemCallbacks::Configure.
+//  So the format that EVERY unhookable deallocator accepts is plain malloc.
 //
-//    operator new(ulong), mode 0 (iOS >= 17 path, mode byte @0x1b0c599 set by
-//    __isPlatformVersionAtLeast(ios 17) → 0 == "modern"):
-//        base = malloc(requested + 0x10);
-//        base[0xC] = size_class;
-//        *(void**)base = base;            // self-pointer header
-//        return base + 0x10;
-//    operator delete(void*):
-//        if (p) { void* base = *(void**)(p - 0x10); free(base); }
-//        (free() resolves two-level to libsystem_malloc — main-executable
-//        exports/interposing do NOT catch it: __interpose does not reach
-//        images dlopen'ed after launch, and two-level binds ignore them too.)
-//
-//  A pointer allocated by plain malloc (i.e. by a tweak whose weak operator
-//  imports bind to this shim) has NO header, so the engine reads *(p-0x10) =
-//  heap garbage G and calls free(G) → SIGABRT in libmalloc. This was crash #2
-//  (mitigated by the free() interposer below) and crash #3, where even the
-//  interposer does not help because it never reaches the guest image.
-//
-//  Real fix: allocate shim memory in the ENGINE'S OWN FORMAT. Every shim
-//  `operator new` returns base+0x10 with *(void**)base == base, so when the
-//  engine (or any other header-based allocator) deletes such a pointer it
-//  reads a valid base and frees it cleanly — no abort, no leak, regardless of
-//  which image crosses the object over. The shim `operator delete` mirror-wise
-//  understands both formats:
-//      1) p is itself the start of a live malloc block  → free(p)
-//         (foreign plain-malloc pointers, engine "mode 1" allocations);
-//      2) *(p-0x10) is a live malloc block whose first word points to itself
-//         (the engine/shim header signature)            → free(*(p-0x10));
-//      3) anything else is silently ignored (leak instead of crash).
-//  malloc_size()/malloc_zone_from_ptr()/malloc_zone_free() are pure libmalloc
-//  queries/entries that are NOT interposed here, so there is no recursion and
-//  no lazy-initialization reentry risk.
-//
-//  The free() interposer from fix #2 is kept as a backstop for frees that
-//  bypass operator delete entirely (it is harmless if dyld ignores it for
-//  late-loaded images).
+//  Crash #2/#3 (engine's own header allocator): blackrussia-client on iOS>=17
+//  allocates with a 16-byte self-pointer header (new: malloc(size+0x10),
+//  *(void**)base = base, return base+0x10; delete: free(*(void**)(p-0x10))).
+//  A pointer allocated by plain malloc has no header, so the engine reads
+//  garbage from *(p-0x10) and free()s it. That free goes through the engine's
+//  GOT slot for `free` — TweakLoader installs a guarded `free` /
+//  `malloc_zone_free` into every guest image's GOT (fishhook, see
+//  TweakLoader.m), which turns that mismatch into a small leak instead of an
+//  abort. The __interpose entry below is the equivalent backstop for images
+//  that are present at launch.
 //
 
 #include <cstdlib>
@@ -74,19 +54,11 @@
 __attribute__((used, visibility("default"))) __attribute__((weak))
 int __lc_operator_shim_weak_anchor = 0;
 
-// Header size used by the guest engine's custom allocator (see file comment).
-static const std::size_t kLcHeaderSize = 0x10;
-
 static inline void* lc_alloc(std::size_t size) {
     if (size == 0) size = 1;
-    std::size_t total;
-    if (__builtin_add_overflow(size, kLcHeaderSize, &total)) throw std::bad_alloc();
     for (;;) {
-        void* base = malloc(total);
-        if (base) {
-            *(void**)base = base; // engine-compatible self-pointer header
-            return (char*)base + kLcHeaderSize;
-        }
+        void* p = malloc(size);
+        if (p) return p;
         std::new_handler h = std::get_new_handler();
         if (!h) throw std::bad_alloc();
         h();
@@ -95,33 +67,15 @@ static inline void* lc_alloc(std::size_t size) {
 
 static inline void* lc_alloc_nothrow(std::size_t size) noexcept {
     if (size == 0) size = 1;
-    std::size_t total;
-    if (__builtin_add_overflow(size, kLcHeaderSize, &total)) return nullptr;
-    void* base = malloc(total);
-    if (!base) return nullptr;
-    *(void**)base = base;
-    return (char*)base + kLcHeaderSize;
+    return malloc(size);
 }
 
-// Aligned allocation keeps the same header layout: [base] = base, returned
-// pointer = (aligned position inside the block). For alignment > 16 the
-// header word lives at returned-0x10 inside the block, and the block start
-// still carries the self-pointer so the delete path can recognize it.
 static inline void* lc_alloc_aligned(std::size_t size, std::size_t alignment) {
-    if (alignment < 16) alignment = 16;
     if (size == 0) size = 1;
-    std::size_t total;
-    if (__builtin_add_overflow(size, kLcHeaderSize, &total) ||
-        __builtin_add_overflow(total, alignment, &total)) throw std::bad_alloc();
+    if (alignment < sizeof(void*)) alignment = sizeof(void*);
     for (;;) {
-        void* raw = nullptr;
-        if (posix_memalign(&raw, alignment, total) == 0 && raw) {
-            char* p = (char*)raw + kLcHeaderSize;
-            p = (char*)(((uintptr_t)p + alignment - 1) & ~(uintptr_t)(alignment - 1));
-            ((void**)p)[-1] = raw;
-            *(void**)raw = raw;
-            return p;
-        }
+        void* p = nullptr;
+        if (posix_memalign(&p, alignment, size) == 0) return p;
         std::new_handler h = std::get_new_handler();
         if (!h) throw std::bad_alloc();
         h();
@@ -129,24 +83,20 @@ static inline void* lc_alloc_aligned(std::size_t size, std::size_t alignment) {
 }
 
 static inline void* lc_alloc_aligned_nothrow(std::size_t size, std::size_t alignment) noexcept {
-    if (alignment < 16) alignment = 16;
     if (size == 0) size = 1;
-    std::size_t total;
-    if (__builtin_add_overflow(size, kLcHeaderSize, &total) ||
-        __builtin_add_overflow(total, alignment, &total)) return nullptr;
-    void* raw = nullptr;
-    if (posix_memalign(&raw, alignment, total) != 0 || !raw) return nullptr;
-    char* p = (char*)raw + kLcHeaderSize;
-    p = (char*)(((uintptr_t)p + alignment - 1) & ~(uintptr_t)(alignment - 1));
-    ((void**)p)[-1] = raw;
-    *(void**)raw = raw;
+    if (alignment < sizeof(void*)) alignment = sizeof(void*);
+    void* p = nullptr;
+    if (posix_memalign(&p, alignment, size) != 0) return nullptr;
     return p;
 }
 
 #define LC_SHIM_EXPORT __attribute__((used, visibility("default")))
 
 // free() with an allocator-mismatch guard: ignores pointers that are not the
-// start of a live malloc allocation. Backstop only (see file comment).
+// start of a live malloc allocation (wild pointers AND interior pointers).
+// malloc_size()/malloc_zone_from_ptr()/malloc_zone_free() are pure libmalloc
+// queries/entries that are NOT interposed here, so there is no recursion and
+// no lazy-initialization reentry risk.
 static inline void lc_free_guarded(void* p) {
     if (!p) return;
     if (malloc_size(p) == 0) return; // not a live allocation start: ignore
@@ -166,14 +116,14 @@ __attribute__((used)) static const struct lc_interpose_pair lc_free_interposer
         (const void*)&free,
     };
 
-// The universal shim delete: frees pointers produced by this shim, by the
-// guest engine's header allocator, or by plain malloc; swallows everything
-// else (leak instead of abort).
+// The universal shim delete: frees pointers produced by this shim (plain
+// malloc), pointers produced by a guest's header-based allocator (interior
+// pointer with a self-pointer header), and plain foreign pointers; swallows
+// everything else (leak instead of abort).
 static inline void lc_shim_delete(void* p) noexcept {
     if (!p) return;
-    // 1) p is the start of a live malloc block (plain foreign pointer, or a
-    //    base pointer handed back directly). Header-format pointers are
-    //    interior (base+0x10), so malloc_size(p) == 0 for them.
+    // 1) p is the start of a live malloc block (plain pointer, or a header
+    //    allocator's base handed back directly).
     if (malloc_size(p) != 0) {
         malloc_zone_t* zone = malloc_zone_from_ptr(p);
         malloc_zone_free(zone ? zone : malloc_default_zone(), p);
@@ -181,9 +131,9 @@ static inline void lc_shim_delete(void* p) noexcept {
     }
     // 2) header-format pointer: base = *(p - 0x10). Only free it when the
     //    block start exists AND carries the self-pointer signature
-    //    (*(base) == base) shared by the engine allocator and this shim.
-    if ((uintptr_t)p > kLcHeaderSize) {
-        void* base = *(void**)((char*)p - kLcHeaderSize);
+    //    (*(base) == base) used by guest header allocators.
+    if ((uintptr_t)p > 0x10) {
+        void* base = *(void**)((char*)p - 0x10);
         if (base && malloc_size(base) != 0 && *(void**)base == base) {
             malloc_zone_t* zone = malloc_zone_from_ptr(base);
             malloc_zone_free(zone ? zone : malloc_default_zone(), base);

@@ -2,7 +2,62 @@
 #import <UIKit/UIKit.h>
 #include <dlfcn.h>
 #include <objc/runtime.h>
+#include <malloc/malloc.h>
+#include <mach-o/dyld.h>
 #import "../LiveContainer/utils.h"
+// fishhook is compiled into this translation unit on purpose: it keeps the
+// TweakLoader target's file list (and project.pbxproj) unchanged.
+#include "fishhook.c"
+
+// --- Guest free() guard -----------------------------------------------------
+//
+// Guest apps with custom C++ allocators (e.g. Black Russia's engine, whose
+// operator delete frees *(void**)(p - 0x10) — the base pointer stored in a
+// 16-byte header) can end up calling free() on pointers that were allocated
+// by other allocators (shim operator new in tweak dylibs, plain malloc in
+// guest frameworks). libmalloc aborts such frees with
+// "pointer being freed was not allocated" -> SIGABRT. The engine's free goes
+// through its own __got slot; __interpose from the main executable does not
+// reach images dlopen'ed after launch, so instead we rebind free /
+// malloc_zone_free directly in every guest image (Documents/Applications and
+// Documents/Tweaks) with fishhook. Valid frees are forwarded unchanged, so
+// behavior only differs for bogus pointers, which become small leaks.
+
+static void LCGuardedFree(void *p) {
+    if (!p) return;
+    if (malloc_size(p) == 0) return; // not a live allocation start: ignore
+    malloc_zone_t *zone = malloc_zone_from_ptr(p);
+    malloc_zone_free(zone ? zone : malloc_default_zone(), p);
+}
+
+static void LCGuardedZoneFree(malloc_zone_t *zone, void *p) {
+    if (!p) return;
+    if (malloc_size(p) == 0) return;
+    malloc_zone_free(zone ? zone : malloc_default_zone(), p);
+}
+
+static void LCGuardGuestImages(const struct mach_header *mh, intptr_t slide) {
+    Dl_info info;
+    if (!dladdr((const void *)mh, &info) || !info.dli_fname) return;
+    const char *path = info.dli_fname;
+    if (!path) return;
+    // Only patch guest app images and tweaks; LC's own images keep plain free.
+    if (!strstr(path, "/Documents/Applications/") && !strstr(path, "/Documents/Tweaks/")) return;
+    struct rebinding rebindings[] = {
+        { "free", (void *)LCGuardedFree, NULL },
+        { "malloc_zone_free", (void *)LCGuardedZoneFree, NULL },
+    };
+    rebind_symbols_image((void *)mh, slide, rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+}
+
+__attribute__((constructor))
+static void LCGuardedFreeInstall(void) {
+    // Fires for every already-loaded image right away (guest binaries and
+    // frameworks are loaded before TweakLoader) and for every image loaded
+    // later (tweak dylibs), always before the new image's initializers run.
+    _dyld_register_func_for_add_image(LCGuardGuestImages);
+}
+// ---------------------------------------------------------------------------
 
 static NSString *loadTweakAtURL(NSURL *url) {
     NSString *tweakPath = url.path;
