@@ -9,19 +9,36 @@
 // TweakLoader target's file list (and project.pbxproj) unchanged.
 #include "fishhook.c"
 
-// --- Guest free() guard -----------------------------------------------------
+// --- Guest free() guard + allocator-mode fix --------------------------------
 //
-// Guest apps with custom C++ allocators (e.g. Black Russia's engine, whose
-// operator delete frees *(void**)(p - 0x10) — the base pointer stored in a
-// 16-byte header) can end up calling free() on pointers that were allocated
-// by other allocators (shim operator new in tweak dylibs, plain malloc in
-// guest frameworks). libmalloc aborts such frees with
-// "pointer being freed was not allocated" -> SIGABRT. The engine's free goes
-// through its own __got slot; __interpose from the main executable does not
-// reach images dlopen'ed after launch, so instead we rebind free /
-// malloc_zone_free directly in every guest image (Documents/Applications and
-// Documents/Tweaks) with fishhook. Valid frees are forwarded unchanged, so
-// behavior only differs for bogus pointers, which become small leaks.
+// ROOT CAUSE (crashes #2-#5, Black Russia): the guest engine picks its C++
+// allocator format lazily via a __cxa_guard-protected static constructor:
+//     mode = (availability_version_check(2, 17.0.0) == 0) ? 1 : 0;
+// mode 1 = plain malloc/free (matches the shared-cache libc++ deallocators),
+// mode 0 = malloc(size+0x10) with a self-pointer header, delete frees
+// *(p-0x10). availability_version_check consults dyld about the MAIN
+// EXECUTABLE's build info — under LiveContainer that is LiveContainer itself
+// (fresh SDK), so the check "passes" and the guest runs in header mode. Its
+// strings then cross into the out-of-line std::string code inside the shared
+// cache libc++.1.dylib, which frees with a plain unhookable free ->
+// "pointer being freed was not allocated" -> SIGABRT in both directions
+// (guest header pointer freed by libc++ __grow_by, and libc++abi plain
+// pointer freed by the guest's free(*(p-0x10))). On a normal install the
+// guest IS the main executable, the check fails on old SDKs and it stays in
+// the plain mode — which is exactly what we restore here.
+//
+// Fix: rebind availability_version_check in every guest image (fishhook, the
+// GOT slot is read before the fast path caches it) to a stub returning 0, so
+// the guest selects the legacy plain-malloc allocator, identical to stock.
+//
+// Additionally, guest apps can still call free() on pointers that were
+// allocated by other allocators. libmalloc aborts such frees with
+// "pointer being freed was not allocated" -> SIGABRT. We therefore rebind
+// free / malloc_zone_free in every guest image (Documents/Applications and
+// Documents/Tweaks) with fishhook as well. Valid frees are forwarded
+// unchanged, so behavior only differs for bogus pointers, which become small
+// leaks. __interpose from the main executable does not reach images
+// dlopen'ed after launch, hence fishhook.
 
 static void LCGuardedFree(void *p) {
     if (!p) return;
@@ -36,6 +53,15 @@ static void LCGuardedZoneFree(malloc_zone_t *zone, void *p) {
     malloc_zone_free(zone ? zone : malloc_default_zone(), p);
 }
 
+// Guests must not inherit LiveContainer's (the main executable's) build-info
+// based availability answers. Returning 0 = "requirement not met" puts the
+// guest on the legacy code path of whatever it is gating (allocator format,
+// OS feature gates), which is the path that runs on older iOS versions and
+// is therefore the battle-tested one.
+static int LCLegacyAvailabilityCheck(uint32_t count, void *args) {
+    return 0;
+}
+
 static void LCGuardGuestImages(const struct mach_header *mh, intptr_t slide) {
     Dl_info info;
     if (!dladdr((const void *)mh, &info) || !info.dli_fname) return;
@@ -46,8 +72,10 @@ static void LCGuardGuestImages(const struct mach_header *mh, intptr_t slide) {
     struct rebinding rebindings[] = {
         { "free", (void *)LCGuardedFree, NULL },
         { "malloc_zone_free", (void *)LCGuardedZoneFree, NULL },
+        { "availability_version_check", (void *)LCLegacyAvailabilityCheck, NULL },
     };
     rebind_symbols_image((void *)mh, slide, rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+    NSLog(@"[LC] guest image guarded: %s", path);
 }
 
 __attribute__((constructor))
