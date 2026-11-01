@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		7EC0DE0000000000000000A1 /* OperatorShims.mm in Sources */ = {isa = PBXBuildFile; fileRef = 7EC0DE0000000000000000B2 /* OperatorShims.mm */; };
+		7EC0DE0000000000000000C3 /* OperatorShims.mm in Sources */ = {isa = PBXBuildFile; fileRef = 7EC0DE0000000000000000B2 /* OperatorShims.mm */; };
 		173545AF2E2C7913001B3B4C /* SideStoreSupport.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 173545A82E2C7913001B3B4C /* SideStoreSupport.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		17413FBC2D9C0BAE00F3F928 /* LiveContainerSwiftUI.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 17413FB52D9C0BAE00F3F928 /* LiveContainerSwiftUI.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		174140902D9C0E8200F3F928 /* TweakLoader.dylib in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 1741403A2D9C0D0000F3F928 /* TweakLoader.dylib */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
@@ -1024,6 +1025,7 @@
 				E1292C082DCA434F0065E12D /* LCSharedUtils.m in Sources */,
 				E1292C0B2DCA43560065E12D /* LCBootstrap.m in Sources */,
 				E1292C0A2DCA43540065E12D /* utils.m in Sources */,
+				7EC0DE0000000000000000C3 /* OperatorShims.mm in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1619,7 +1621,10 @@
 				);
 				MARKETING_VERSION = 3.3.55;
 				NEW_SETTING = "";
-				OTHER_LDFLAGS = "-Wl,-export_dynamic";
+				OTHER_LDFLAGS = (
+					"-Wl,-export_dynamic",
+					"-Wl,-exported_symbols_list,$(SRCROOT)/LiveContainer/operator_shims.exp",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER)";
 				PRODUCT_NAME = LiveContainer;
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -1667,6 +1672,7 @@
 					"-e",
 					_LiveContainerMainC,
 					"-Wl,-export_dynamic",
+					"-Wl,-exported_symbols_list,$(SRCROOT)/LiveContainer/operator_shims.exp",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER)";
 				PRODUCT_NAME = LiveContainer;

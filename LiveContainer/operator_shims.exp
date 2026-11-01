@@ -1,0 +1,24 @@
+# Strong C++ allocation operator definitions from OperatorShims.mm.
+# Forces them into the main executable's export trie and protects them
+# from dead code stripping. Mach-O (nm-style) names.
+__Znwm
+__Znam
+__ZnwmRKSt9nothrow_t
+__ZnamRKSt9nothrow_t
+__ZnwmSt11align_val_t
+__ZnamSt11align_val_t
+__ZnwmSt11align_val_tRKSt9nothrow_t
+__ZnamSt11align_val_tRKSt9nothrow_t
+__ZdlPv
+__ZdlPvm
+__ZdlPvRKSt9nothrow_t
+__ZdlPvSt11align_val_t
+__ZdlPvmSt11align_val_t
+__ZdlPvSt11align_val_tRKSt9nothrow_t
+__ZdaPv
+__ZdaPvm
+__ZdaPvRKSt9nothrow_t
+__ZdaPvSt11align_val_t
+__ZdaPvmSt11align_val_t
+__ZdaPvSt11align_val_tRKSt9nothrow_t
+___lc_operator_shim_weak_anchor
