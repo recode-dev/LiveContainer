@@ -282,10 +282,13 @@ static void *getAppEntryPoint(void *handle) {
 //     malloc/free allocator (mode 1) instead of the 16-byte-header pool
 //     (mode 0) whose buffers abort when shared-cache libc++ std::string code
 //     frees them ("pointer being freed was not allocated");
-//   - additionally the engine's allocator mode byte is forced directly for
-//     the exact game binary seen in every crash report (gated by UUID and
-//     function-prologue signatures), so the fix does not depend on the
-//     availability path at all.
+//   - additionally the engine's allocator mode byte is forced directly, so the
+//     fix does not depend on the availability path at all. The two globals are
+//     discovered from the engine's own operator new/delete (see the pin block
+//     below), not from a UUID or fixed offsets;
+//   - the inline availability path (__isPlatformVersionAtLeast) is redirected
+//     only for images that carry no Swift metadata: a Swift guest must keep
+//     truthful answers, a C/C++ engine is the one that needs the legacy mode.
 
 static int LCLegacyAvailabilityCheck(uint32_t count, void *versions) {
     return 0;
@@ -320,8 +323,21 @@ void LCOverwriteGotSlotsInImage(const struct mach_header *mh, intptr_t slide,
             const struct section_64 *sections = (const struct section_64 *)(cursor + sizeof(struct segment_command_64));
             for (uint32_t s = 0; s < seg->nsects; s++) {
                 const struct section_64 *sect = &sections[s];
+                // ptrauth-signed slots never compare equal to a plain address,
+                // and writing a raw pointer into one traps on the next
+                // authenticated branch: leave them alone.
+                if (strncmp(sect->sectname, "__auth", 6) == 0) continue;
                 uint8_t type = sect->flags & SECTION_TYPE;
-                if (type != S_NON_LAZY_SYMBOL_POINTERS && type != S_LAZY_SYMBOL_POINTERS) continue;
+                // Match by section type as before, and also by name: some
+                // linkers file bindings in a __got whose section type is not
+                // one of the symbol-pointer kinds, and a missed section means a
+                // silent no-op rebind.
+                bool isGot = (type == S_NON_LAZY_SYMBOL_POINTERS ||
+                              type == S_LAZY_SYMBOL_POINTERS ||
+                              strncmp(sect->sectname, "__got", 5) == 0 ||
+                              strncmp(sect->sectname, "__nl_symbol_ptr", 15) == 0 ||
+                              strncmp(sect->sectname, "__la_symbol_ptr", 15) == 0);
+                if (!isGot) continue;
                 if (sect->size == 0 || sect->size > 0x100000) continue;
                 void **slots = (void **)(uintptr_t)(sect->addr + slide);
                 kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)(uintptr_t)slots,
@@ -574,6 +590,54 @@ static void LCForceLegacyAllocatorMode(const struct mach_header *mh, intptr_t sl
     NSLog(@"[LC] guest allocator mode pinned to plain malloc/free (guard %p, mode %p)", guard, mode);
 }
 
+// Which images may be told the truth about the OS version, and which may not.
+//
+// Answers are faked so legacy engines keep their plain malloc/free allocator
+// mode. A Swift image must not be lied to: falsified availability sends it down
+// branches its own build never exercised, and that is the List<>.init(content:)
+// trap reported for the SwiftUI guests. Swift metadata is the dividing line and
+// it is visible in the image itself, so nothing is listed by name.
+static bool LCImageHasSwiftMetadata(const struct mach_header *mh) {
+    const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cursor;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cursor;
+            const struct section_64 *sections = (const struct section_64 *)(cursor + sizeof(struct segment_command_64));
+            for (uint32_t s = 0; s < seg->nsects; s++) {
+                if (strncmp(sections[s].sectname, "__swift5", 8) == 0) {
+                    return true;
+                }
+            }
+        }
+        cursor += lc->cmdsize;
+    }
+    return false;
+}
+
+// Inline availability checks (the ones compilers emit for #available) go
+// through here, not through availability_version_check. Engines that pick their
+// allocator from this call see "iOS 16" and keep plain malloc/free, which is the
+// mode they use on a stock install; anything older than 17 is answered honestly.
+static int LCLegacyPlatformVersionCheck(uint32_t platform, uint32_t major, uint32_t minor, uint32_t subminor) {
+    if (major >= 17) {
+        return 0;
+    }
+    typedef int (*real_pvac_t)(uint32_t, uint32_t, uint32_t, uint32_t);
+    static real_pvac_t real_pvac = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        real_pvac = (real_pvac_t)dlsym(RTLD_DEFAULT, "__isPlatformVersionAtLeast");
+        if (!real_pvac) {
+            real_pvac = (real_pvac_t)dlsym(RTLD_DEFAULT, "___isPlatformVersionAtLeast");
+        }
+    });
+    if (real_pvac && real_pvac != (real_pvac_t)LCLegacyPlatformVersionCheck) {
+        return real_pvac(platform, major, minor, subminor);
+    }
+    return 1;
+}
+
 static void LCGuardGuestImageEarly(const struct mach_header *mh, intptr_t slide) {
     Dl_info info;
     if (!dladdr((const void *)mh, &info) || !info.dli_fname) return;
@@ -581,6 +645,13 @@ static void LCGuardGuestImageEarly(const struct mach_header *mh, intptr_t slide)
     // Only patch guest app images and tweaks; LC's own images keep real answers.
     if (!strstr(path, "/Documents/Applications/") && !strstr(path, "/Documents/Tweaks/")) return;
     LCOverwriteGotSlotsInImage(mh, slide, "availability_version_check", (void *)LCLegacyAvailabilityCheck);
+    if (LCImageHasSwiftMetadata(mh)) {
+        // Swift guest: hands off the inline checks (see LCImageHasSwiftMetadata).
+        NSLog(@"[LC] guest image is Swift, availability left untouched: %s", path);
+    } else {
+        LCOverwriteGotSlotsInImage(mh, slide, "__isPlatformVersionAtLeast", (void *)LCLegacyPlatformVersionCheck);
+        LCOverwriteGotSlotsInImage(mh, slide, "___isPlatformVersionAtLeast", (void *)LCLegacyPlatformVersionCheck);
+    }
     LCOverwriteGotSlotsInImage(mh, slide, "free", (void *)LCGuardedFreeEarly);
     LCOverwriteGotSlotsInImage(mh, slide, "malloc_zone_free", (void *)LCGuardedZoneFreeEarly);
     // The engine does not have to be the app executable: in the reported case
