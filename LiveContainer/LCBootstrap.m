@@ -13,6 +13,8 @@
 #include <execinfo.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <malloc/malloc.h>
@@ -588,8 +590,16 @@ static void LCInstallGuestAllocatorGuard(void) {
     static bool installed = false;
     if (installed) return;
     installed = true;
-    // Escape hatch for builds where the guard itself is suspected: set
-    // dontGuardGuestImages in the app's LCAppInfo.plist.
+    // This guard was written for legacy engines whose allocator mode is chosen
+    // from the OS version they see (see the notes above). It rewrites GOT slots
+    // in every guest image, so it is opt-in per app: a SwiftUI guest gains
+    // nothing from it and only inherits the risk of having its images
+    // rewritten.
+    bool optedIn = [guestAppInfo[@"legacyAllocatorGuard"] boolValue];
+    if (!optedIn) {
+        NSLog(@"[LC] guest allocator guard off (set legacyAllocatorGuard for engines that need it)");
+        return;
+    }
     if ([guestAppInfo[@"dontGuardGuestImages"] boolValue]) {
         NSLog(@"[LC] guest allocator guard disabled by LCAppInfo");
         return;
@@ -604,6 +614,69 @@ static void LCInstallGuestAllocatorGuard(void) {
     NSLog(@"[LC] guest allocator guard registered");
 }
 // ---------------------------------------------------------------------------
+
+// The guest keeps trapping on a call into __TEXT padding at a fixed image
+// offset (image base + 0x3C9D24 for one of them, identical across launches with
+// different slides). A pointer that always resolves to "image + N" is an
+// image-relative pointer that dyld rebased correctly, so the guest's metadata is
+// pointing at an address whose content is not the code it expects - which can
+// only happen if the mapped code is not the code the metadata was linked
+// against. Compare sampled pages of the loaded image against the file it came
+// from, so the next crash log says whether the mapping or the binary is at fault.
+static void LCCheckGuestImageMatchesFile(const char *execPath) {
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)getGuestAppHeader();
+    if (!mh || !execPath) {
+        NSLog(@"[LC] guest __TEXT check skipped (header %p)", mh);
+        return;
+    }
+    intptr_t slide = LCImageSlide(mh);
+    uint64_t textVMAddr = 0, textFileOff = 0, textFileSize = 0;
+    const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cursor;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cursor;
+            if (strcmp(seg->segname, "__TEXT") == 0) {
+                textVMAddr = seg->vmaddr;
+                textFileOff = seg->fileoff;
+                textFileSize = seg->filesize;
+                break;
+            }
+        }
+        cursor += lc->cmdsize;
+    }
+    if (textFileSize == 0) return;
+
+    int fd = open(execPath, O_RDONLY);
+    if (fd < 0) {
+        NSLog(@"[LC] guest __TEXT check: cannot open %s", execPath);
+        return;
+    }
+    const uint64_t pageSize = 0x4000;
+    const int samples = 32;
+    uint64_t stride = (textFileSize / samples) & ~(pageSize - 1);
+    if (stride == 0) stride = pageSize;
+    uint8_t fileBuf[0x4000];
+    int mismatches = 0;
+    for (int s = 0; s < samples && mismatches < 4; s++) {
+        uint64_t fileRel = (uint64_t)s * stride;
+        if (fileRel + pageSize > textFileSize) break;
+        ssize_t got = pread(fd, fileBuf, pageSize, (off_t)(textFileOff + fileRel));
+        if (got != (ssize_t)pageSize) continue;
+        const uint8_t *mapped = (const uint8_t *)(uintptr_t)(textVMAddr + (uint64_t)slide + fileRel);
+        if (memcmp(mapped, fileBuf, pageSize) != 0) {
+            size_t diff = 0;
+            while (diff < pageSize && mapped[diff] == fileBuf[diff]) diff++;
+            NSLog(@"[LC] guest __TEXT mismatch at image+0x%llx (file off 0x%llx): mapped 0x%02x vs file 0x%02x",
+                  (unsigned long long)fileRel, (unsigned long long)(textFileOff + fileRel),
+                  mapped[diff], fileBuf[diff]);
+            mismatches++;
+        }
+    }
+    close(fd);
+    NSLog(@"[LC] guest __TEXT check: %d of %d sampled pages differ (base %p slide 0x%llx textSize 0x%llx)",
+          mismatches, samples, mh, (unsigned long long)slide, (unsigned long long)textFileSize);
+}
 
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
     NSString *appError = nil;
@@ -937,7 +1010,15 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     
     BOOL is27up = false;
     if(@available(iOS 27, *)) { is27up = true; }
+    NSLog(@"[LC] guest launch %@ rev=%@ segCountMismatch=%d dontInjectTweakLoader=%d classicMode=%d isJITNeeded=%d spoofSDK=%@",
+          selectedApp, guestAppInfo[@"LCPatchRevision"],
+          [guestAppInfo[@"segCountMismatch"] boolValue],
+          [guestAppInfo[@"dontInjectTweakLoader"] boolValue],
+          [guestAppInfo[@"classicMode"] boolValue],
+          [guestAppInfo[@"isJITNeeded"] boolValue],
+          guestAppInfo[@"spoofSDKVersion"]);
     if(is27up && [guestAppInfo[@"segCountMismatch"] boolValue]) {
+        NSLog(@"[LC] bypassing dyld chained fixups validation for this guest");
         bypass_seg_count_check(dlopenBlock);
     } else {
         dlopenBlock();
@@ -945,6 +1026,10 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
 
     appExecutableHandle = appHandle;
     const char *dlerr = dlerror();
+
+    if (appHandle && (uint64_t)appHandle <= 0xf00000000000) {
+        LCCheckGuestImageMatchesFile(appExecPath);
+    }
     
     if (!appHandle || (uint64_t)appHandle > 0xf00000000000) {
         if (dlerr) {
