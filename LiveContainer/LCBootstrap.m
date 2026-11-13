@@ -727,27 +727,12 @@ static bool LCGuestSpoofAvailableForImage(const struct mach_header *mh, const ch
 //
 // Answering availability checks differently only steers the engine towards its
 // plain mode; that worked in the build where the mode byte was pinned, and it is
-// why every availability-only attempt still aborted. The structural fix is to
-// put the allocations themselves on plain malloc/free, which is what a stock
-// install ends up doing: hook the guest's own operator new/delete when it
-// defines them. A pair is only hooked when both halves are present, otherwise
-// allocation and release would disagree again.
+// why every availability-only attempt still aborted. Hooking the operator
+// functions themselves is not an option here: rewriting their code pages makes
+// the kernel refuse execute permission and the process is killed with
+// "CODESIGNING / Invalid Page". So the mode the engine would have chosen is set
+// directly instead, located from the operators' own code (data pages only).
 // ---------------------------------------------------------------------------
-
-static void *lcPlainAlloc(size_t n) {
-    return malloc(n ? n : 1);
-}
-
-static void *lcPlainAllocAligned(size_t n, size_t align) {
-    void *p = NULL;
-    if (align < sizeof(void *)) align = sizeof(void *);
-    if (posix_memalign(&p, align, n ? n : 1) != 0) return NULL;
-    return p;
-}
-
-static void lcPlainRelease(void *p) {
-    free(p);
-}
 
 // Mach-O symbol names carry the leading underscore of the C symbol.
 //
@@ -797,36 +782,125 @@ static void *lcFindSymbolInImage(const struct mach_header_64 *mh, intptr_t slide
     return NULL;
 }
 
-static void LCHookGuestAllocationOperators(const struct mach_header *mh, intptr_t slide, const char *path) {
+// Scan a short window starting at a known function for the guard + mode pair.
+// Anchoring on operator new/delete beats scanning all of __text: the shape only
+// has to be recognised in a few hundred instructions, and the two functions can
+// be cross-checked against each other.
+static bool lcFindModePairNear(void *func, uint64_t windowInsns, bool strictOnly,
+                               const struct mach_header *mh, intptr_t slide,
+                               void **guardOut, void **modeOut) {
+    if (!func) return false;
+    const uint32_t *code = (const uint32_t *)func;
+    uint64_t codeVA = (uint64_t)(uintptr_t)func;
+    uint64_t count = windowInsns;
+    if (count < 24) return false;
+
+    for (uint64_t i = 0; i + 24 < count; i++) {
+        if (!lcIsLdarb(code[i]) && !lcIsLdrbImm(code[i])) continue;
+
+        uint64_t tbz = 0;
+        for (uint64_t k = i + 1; k <= i + 8 && k < count; k++) {
+            if (lcIsTbz(code[k])) { tbz = k; break; }
+        }
+        if (!tbz) continue;
+
+        void *guard = lcResolveLoadTarget(code, (uint32_t)count, (uint32_t)i, codeVA, lcInsnRn(code[i]));
+        if (!guard) continue;
+        if (!lcAddressWritableInImage(mh, slide, guard)) continue;
+        if (*(volatile uint64_t *)guard != 0) continue;
+
+        for (uint64_t k = tbz + 1; k <= tbz + 20 && k < count; k++) {
+            if (!lcIsLdarb(code[k]) && !lcIsLdrbImm(code[k])) continue;
+            void *mode = lcResolveLoadTarget(code, (uint32_t)count, (uint32_t)k, codeVA, lcInsnRn(code[k]));
+            if (!mode || mode == guard) continue;
+            if (!lcAddressWritableInImage(mh, slide, mode)) continue;
+            if (*(volatile uint8_t *)mode > 1) continue;
+
+            uintptr_t a = (uintptr_t)guard, b = (uintptr_t)mode;
+            uintptr_t delta = a > b ? a - b : b - a;
+            if (delta > 0x200) continue;
+
+            if (strictOnly) {
+                // require the compare-and-branch right behind the mode load
+                bool sawCmp = false, sawBranch = false;
+                for (uint64_t c = k + 1; c <= k + 3 && c < count; c++) {
+                    if (!sawCmp) {
+                        if ((code[c] & 0xFFC00000) == 0x71000000 && (code[c] & 0x1F) == 0x1F) { sawCmp = true; continue; }
+                        if ((code[c] & 0x7E000000) == 0x34000000) { sawBranch = true; break; } // cbz/cbnz
+                        continue;
+                    }
+                    if (lcIsBCond(code[c])) { sawBranch = true; break; }
+                }
+                if (!sawBranch) continue;
+            }
+
+            *guardOut = guard;
+            *modeOut = mode;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void LCPinAllocatorModeFromOperators(const struct mach_header *mh, intptr_t slide, const char *path) {
     const struct mach_header_64 *mh64 = (const struct mach_header_64 *)mh;
     if (!mh64 || mh64->magic != MH_MAGIC_64) return;
 
-    void *znwm = lcFindSymbolInImage(mh64, slide, "__Znwm");
-    void *zdlpv = lcFindSymbolInImage(mh64, slide, "__ZdlPv");
-    if (!znwm || !zdlpv) {
-        return; // this image does not override the operators: nothing to align
-    }
+    void *newFn = lcFindSymbolInImage(mh64, slide, "__Znwm");
+    void *delFn = lcFindSymbolInImage(mh64, slide, "__ZdlPv");
+    if (!newFn && !delFn) return;
 
-    kern_return_t rcDel = litehook_hook_function(zdlpv, (void *)lcPlainRelease);
-    kern_return_t rcNew = litehook_hook_function(znwm, (void *)lcPlainAlloc);
-    NSLog(@"[LC] guest allocation operators -> malloc/free (rc %d/%d): %s", (int)rcNew, (int)rcDel, path ? path : "?");
+    void *gNew = NULL, *mNew = NULL, *gDel = NULL, *mDel = NULL;
+    bool foundNew = lcFindModePairNear(newFn, 512, false, mh, slide, &gNew, &mNew);
+    bool foundDel = lcFindModePairNear(delFn, 512, false, mh, slide, &gDel, &mDel);
 
-    // Optional siblings, each pair handled on its own.
-    struct { const char *newSym; const char *delSym; bool aligned; } pairs[] = {
-        { "__Znam", "__ZdaPv", false },
-        { "__ZnwmSt11align_val_t", "__ZdlPvSt11align_val_t", true },
-        { "__ZnamSt11align_val_t", "__ZdaPvSt11align_val_t", true },
-        { "__ZnwmRKSt9nothrow_t", "__ZdlPvRKSt9nothrow_t", false },
-    };
-    for (unsigned i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
-        void *n = lcFindSymbolInImage(mh64, slide, pairs[i].newSym);
-        void *d = lcFindSymbolInImage(mh64, slide, pairs[i].delSym);
-        if (!n || !d) continue;
-        litehook_hook_function(d, (void *)lcPlainRelease);
-        litehook_hook_function(n, pairs[i].aligned ? (void *)lcPlainAllocAligned : (void *)lcPlainAlloc);
+    void *guard = NULL, *mode = NULL;
+    if (foundNew && foundDel && gNew == gDel && mNew == mDel) {
+        guard = gNew;
+        mode = mNew;
+    } else if (foundNew) {
+        // Cross-check by strict shape only when the second function disagrees.
+        guard = gNew;
+        mode = mNew;
+        bool strict = lcFindModePairNear(newFn, 512, true, mh, slide, &gNew, &mNew);
+        if (!strict) {
+            NSLog(@"[LC] allocator mode: only one function matched, skipping (%s)", path ? path : "?");
+            return;
+        }
+    } else if (foundDel) {
+        guard = gDel;
+        mode = mDel;
+    } else {
+        NSLog(@"[LC] allocator mode: operator%s found but no guard/mode pair (%s)",
+              newFn ? " new" : " delete", path ? path : "?");
+        return;
     }
+    if (!guard || !mode) return;
+
+    uintptr_t lo = ((uintptr_t)guard < (uintptr_t)mode ? (uintptr_t)guard : (uintptr_t)mode) & ~(uintptr_t)0xFFF;
+    uintptr_t hi = (((uintptr_t)guard > (uintptr_t)mode ? (uintptr_t)guard : (uintptr_t)mode) + 8 + 0xFFF) & ~(uintptr_t)0xFFF;
+    if (hi <= lo || hi - lo > 0x10000) return;
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)lo, (vm_size_t)(hi - lo), 0,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) return;
+
+    *(volatile uint64_t *)guard = 1;
+    *(volatile uint8_t *)mode = 1;
+    NSLog(@"[LC] allocator mode pinned from operator%s (guard %p, mode %p): %s",
+          foundNew ? " new" : " delete", guard, mode, path ? path : "?");
 }
 
+// Which images may be told the truth about the OS version, and which may not.
+//
+// Answers are faked so legacy engines keep their plain malloc/free allocator
+// mode. A Swift image must not be lied to: falsified availability sends it down
+// branches its own build never exercised, and that is the List<>.init(content:)
+// trap reported for the SwiftUI guests. Swift metadata is the dividing line and
+// it is visible in the image itself, so nothing is listed by name.
+// Guest compatibility mode, chosen in the 5-tap developer section of Settings:
+//   0 Auto (default) - decide per image, see LCGuestSpoofAvailableForImage
+//   1 New            - truthful answers to every guest image
+//   2 Old            - legacy answers to every guest image
 static void LCGuardGuestImageEarly(const struct mach_header *mh, intptr_t slide) {
     Dl_info info;
     if (!dladdr((const void *)mh, &info) || !info.dli_fname) return;
@@ -842,9 +916,9 @@ static void LCGuardGuestImageEarly(const struct mach_header *mh, intptr_t slide)
     }
     LCOverwriteGotSlotsInImage(mh, slide, "free", (void *)LCGuardedFreeEarly);
     LCOverwriteGotSlotsInImage(mh, slide, "malloc_zone_free", (void *)LCGuardedZoneFreeEarly);
-    // Plain allocations first: the abort this fixes happens during the image's
-    // own initializers, before any of the availability answers matter.
-    LCHookGuestAllocationOperators(mh, slide, path);
+    // The engine's allocator mode, located from its own operator new/delete.
+    // Data only: patching code pages here trips the code-signing monitor.
+    LCPinAllocatorModeFromOperators(mh, slide, path);
 
     // The engine does not have to be the app executable: in the reported case
     // it is a framework inside the bundle (Frameworks/blackrussia-client),
