@@ -333,11 +333,6 @@
                 }
                 if(patchResult & PATCH_EXEC_RESULT_SEG_COUNT_MISMATCH) {
                     info[@"segCountMismatch"] = @YES;
-                } else {
-                    // A previous patch revision may have flagged this app. The
-                    // flag forces the dyld validation bypass at launch, which
-                    // must not outlive the condition that set it.
-                    [info removeObjectForKey:@"segCountMismatch"];
                 }
             }
             isEncrypted |= LCIsMachOEncrypted(header);

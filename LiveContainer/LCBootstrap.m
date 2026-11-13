@@ -590,16 +590,6 @@ static void LCInstallGuestAllocatorGuard(void) {
     static bool installed = false;
     if (installed) return;
     installed = true;
-    // This guard was written for legacy engines whose allocator mode is chosen
-    // from the OS version they see (see the notes above). It rewrites GOT slots
-    // in every guest image, so it is opt-in per app: a SwiftUI guest gains
-    // nothing from it and only inherits the risk of having its images
-    // rewritten.
-    bool optedIn = [guestAppInfo[@"legacyAllocatorGuard"] boolValue];
-    if (!optedIn) {
-        NSLog(@"[LC] guest allocator guard off (set legacyAllocatorGuard for engines that need it)");
-        return;
-    }
     if ([guestAppInfo[@"dontGuardGuestImages"] boolValue]) {
         NSLog(@"[LC] guest allocator guard disabled by LCAppInfo");
         return;
@@ -646,6 +636,28 @@ static void LCCheckGuestImageMatchesFile(const char *execPath) {
         cursor += lc->cmdsize;
     }
     if (textFileSize == 0) return;
+
+    // Section table of the loaded image. The offset the guest crashes at is
+    // either inside __text (code) or inside a data section of __TEXT - the two
+    // cases mean completely different things, and neither is visible from the
+    // crash report alone.
+    const uint8_t *sectionCursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)sectionCursor;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)sectionCursor;
+            if (strcmp(seg->segname, "__TEXT") == 0 || strcmp(seg->segname, "__TEXT_EXEC") == 0) {
+                const struct section_64 *sections = (const struct section_64 *)(sectionCursor + sizeof(struct segment_command_64));
+                for (uint32_t s = 0; s < seg->nsects; s++) {
+                    NSLog(@"[LC] guest section %s,%s image+0x%llx size 0x%llx",
+                          seg->segname, sections[s].sectname,
+                          (unsigned long long)(sections[s].addr - textVMAddr),
+                          (unsigned long long)sections[s].size);
+                }
+            }
+        }
+        sectionCursor += lc->cmdsize;
+    }
 
     int fd = open(execPath, O_RDONLY);
     if (fd < 0) {

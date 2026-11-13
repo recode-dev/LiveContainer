@@ -137,7 +137,6 @@ int LCPatchExecSlice(const char *path, struct mach_header_64 *header, bool doInj
     struct dylinker_command* dylinkerCommand = 0;
     bool codeSignatureCommandFound = false;
     uint32_t loadCommandSegCount = 0;
-    struct linkedit_data_command *chainedFixupsCommand = NULL;
     for(int i = 0; i < header->ncmds; i++) {
         if(command->cmd == LC_ID_DYLIB) {
             hasDylibCommand = YES;
@@ -165,19 +164,12 @@ int LCPatchExecSlice(const char *path, struct mach_header_64 *header, bool doInj
         } else if (command->cmd == LC_LOAD_DYLINKER) {
             dylinkerCommand = (struct dylinker_command*)command;
         } else if (command->cmd == LC_DYLD_CHAINED_FIXUPS) {
-            // Keep it for the check below: comparing here counts only the
-            // segments seen so far, and LC_DYLD_CHAINED_FIXUPS is not required
-            // to be the last load command. A false mismatch makes the caller
-            // take the dyld bypass path for an image that does not need it.
-            chainedFixupsCommand = (struct linkedit_data_command *)command;
+            if(loadCommandSegCount != get_chained_fixups_seg_count((void*)header, (struct linkedit_data_command *)command)) {
+                ans |= PATCH_EXEC_RESULT_SEG_COUNT_MISMATCH;
+            }
         }
         
         command = (struct load_command *)((void *)command + command->cmdsize);
-    }
-
-    if(chainedFixupsCommand &&
-       loadCommandSegCount != get_chained_fixups_seg_count((void*)header, chainedFixupsCommand)) {
-        ans |= PATCH_EXEC_RESULT_SEG_COUNT_MISMATCH;
     }
     long freeLoadCommandCountLeft = (void*)header + textSectionOffest - (void*)command;
     int tweakLoaderLoadDylibCmdSize = 0x48;
