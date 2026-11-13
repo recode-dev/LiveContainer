@@ -750,19 +750,45 @@ static void lcPlainRelease(void *p) {
 }
 
 // Mach-O symbol names carry the leading underscore of the C symbol.
+//
+// symoff/stroff are *file* offsets, and the symbol and string tables live in
+// __LINKEDIT, which is mapped at its own address - not at image base + offset.
+// Translating through the segment table is what keeps this walk inside the
+// image; reading through mh + symoff segfaults on the first strcmp.
+static void *lcAddressForFileOffset(const struct mach_header_64 *mh, intptr_t slide, uint64_t off) {
+    const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cursor;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cursor;
+            if (seg->filesize > 0 && off >= seg->fileoff && off < seg->fileoff + seg->filesize) {
+                return (void *)(uintptr_t)(seg->vmaddr + (uint64_t)slide + (off - seg->fileoff));
+            }
+        }
+        cursor += lc->cmdsize;
+    }
+    return NULL;
+}
+
 static void *lcFindSymbolInImage(const struct mach_header_64 *mh, intptr_t slide, const char *name) {
+    size_t nameLen = strlen(name);
     const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < mh->ncmds; i++) {
         const struct load_command *lc = (const struct load_command *)cursor;
         if (lc->cmd == LC_SYMTAB) {
             const struct symtab_command *st = (const struct symtab_command *)cursor;
-            const struct nlist_64 *syms = (const struct nlist_64 *)((const uint8_t *)mh + st->symoff);
-            const char *strs = (const char *)mh + st->stroff;
+            const struct nlist_64 *syms = (const struct nlist_64 *)lcAddressForFileOffset(mh, slide, st->symoff);
+            const char *strs = (const char *)lcAddressForFileOffset(mh, slide, st->stroff);
+            if (!syms || !strs || st->strsize < nameLen + 1) return NULL;
             for (uint32_t s = 0; s < st->nsyms; s++) {
-                if (syms[s].n_un.n_strx == 0) continue;
+                uint32_t strx = syms[s].n_un.n_strx;
+                if (strx == 0 || strx >= st->strsize) continue;
                 if ((syms[s].n_type & N_TYPE) != N_SECT) continue;
                 if (syms[s].n_value == 0) continue;
-                if (strcmp(strs + syms[s].n_un.n_strx, name) != 0) continue;
+                if (st->strsize - strx <= nameLen) continue;
+                const char *cand = strs + strx;
+                if (cand[nameLen] != '\0') continue;
+                if (memcmp(cand, name, nameLen) != 0) continue;
                 return (void *)(uintptr_t)(syms[s].n_value + (uint64_t)slide);
             }
         }
