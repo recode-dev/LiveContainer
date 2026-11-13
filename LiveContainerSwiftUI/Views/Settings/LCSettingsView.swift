@@ -60,6 +60,7 @@ struct LCSettingsView: View {
     
     @State var store : Store = .Unknown
     
+    @AppStorage("LCGuestLegacyMode") var guestLegacyMode = false
     @AppStorage("LCLoadTweaksToSelf") var injectToLCItelf = false
     @AppStorage("LCIgnoreJITOnLaunch") var ignoreJITOnLaunch = false
     @AppStorage("LCSelected32BitEmulator", store: LCUtils.appGroupUserDefault) var selected32BitEmulator : String = ""
@@ -321,6 +322,13 @@ struct LCSettingsView: View {
                 
                 if sharedModel.developerMode {
                     Section {
+                        Picker(selection: $guestLegacyMode) {
+                            Text("New").tag(false)
+                            Text("Old").tag(true)
+                        } label: {
+                            Text("Guest mode")
+                        }
+                        .pickerStyle(.segmented)
                         Toggle(isOn: $injectToLCItelf) {
                             Text("lc.settings.injectLCItself".loc)
                         }
@@ -373,7 +381,8 @@ struct LCSettingsView: View {
                     } header: {
                         Text("Developer Settings")
                     } footer: {
-                        Text("lc.settings.injectLCItselfDesc".loc)
+                        Text("lc.settings.injectLCItselfDesc".loc) +
+                        Text("\n\nGuest mode: New answers availability checks truthfully for Swift apps and only spoofs engines without Swift metadata. Old reports an older iOS to every guest image, which legacy engines need but Swift apps may not survive. Restart the guest app after changing it.")
                     }
                 }
             }

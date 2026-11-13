@@ -597,6 +597,17 @@ static void LCForceLegacyAllocatorMode(const struct mach_header *mh, intptr_t sl
 // branches its own build never exercised, and that is the List<>.init(content:)
 // trap reported for the SwiftUI guests. Swift metadata is the dividing line and
 // it is visible in the image itself, so nothing is listed by name.
+// "Old" forces the legacy answers for every guest image; "New" keeps them for
+// the images that need them and leaves Swift ones alone. Exposed in the
+// 5-tap developer section of Settings.
+static bool LCGuestLegacyModeEnabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = [NSUserDefaults.standardUserDefaults boolForKey:@"LCGuestLegacyMode"] ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 static bool LCImageHasSwiftMetadata(const struct mach_header *mh) {
     const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < mh->ncmds; i++) {
@@ -645,7 +656,7 @@ static void LCGuardGuestImageEarly(const struct mach_header *mh, intptr_t slide)
     // Only patch guest app images and tweaks; LC's own images keep real answers.
     if (!strstr(path, "/Documents/Applications/") && !strstr(path, "/Documents/Tweaks/")) return;
     LCOverwriteGotSlotsInImage(mh, slide, "availability_version_check", (void *)LCLegacyAvailabilityCheck);
-    if (LCImageHasSwiftMetadata(mh)) {
+    if (!LCGuestLegacyModeEnabled() && LCImageHasSwiftMetadata(mh)) {
         // Swift guest: hands off the inline checks (see LCImageHasSwiftMetadata).
         NSLog(@"[LC] guest image is Swift, availability left untouched: %s", path);
     } else {
