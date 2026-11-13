@@ -16,6 +16,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <malloc/malloc.h>
+#if __has_feature(ptrauth_calls)
+#include <ptrauth.h>
+#endif
 #include "../litehook/src/litehook.h"
 #import "Tweaks/Tweaks.h"
 #include <mach-o/ldsyms.h>
@@ -108,15 +111,116 @@ static uint64_t rnd64(uint64_t v, uint64_t r) {
     return (v + r) & ~r;
 }
 
+// ---------------------------------------------------------------------------
+// CoreFoundation caches the main bundle in a private global (__mainBundle).
+// Pointing it at the guest bundle is one of the last things we do before the
+// guest dlopen, and getting it wrong corrupts the whole process.
+//
+// The slot used to be located by walking CFBundleGetMainBundle until the first
+// tbz/tbnz branch and emulating the adrp+ldr pair behind it, then writing the
+// bundle pointer there unconditionally. That only holds for the exact
+// CoreFoundation build the pattern was captured on. iOS 27.2 reorders the
+// function again, the walk stops on a different branch, and the write lands in
+// an unrelated CoreFoundation global - which is why guests now die a few
+// hundred ms after launch inside SwiftUI: EXC_BREAKPOINT with the pc sitting in
+// __TEXT padding (an indirect call through a clobbered function pointer) or
+// SIGBUS on a String whose storage points at a region that was never mapped.
+//
+// A slot is now only written when it provably holds the live main bundle, and
+// a value scan over CoreFoundation's own writable segments is used when the
+// instruction pattern does not resolve to such a slot.
+// ---------------------------------------------------------------------------
+
+static intptr_t LCImageSlide(const struct mach_header_64 *mh) {
+    const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cursor;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cursor;
+            if (strcmp(seg->segname, "__TEXT") == 0) {
+                return (intptr_t)mh - (intptr_t)seg->vmaddr;
+            }
+        }
+        cursor += lc->cmdsize;
+    }
+    return 0;
+}
+
+// Is addr inside one of the image's mapped segments? writableOnly additionally
+// requires the segment to be writable at run time.
+static bool LCAddressIsInImageSegment(const struct mach_header_64 *mh, const void *addr, bool writableOnly) {
+    if (!mh || !addr) return false;
+    intptr_t slide = LCImageSlide(mh);
+    const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cursor;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cursor;
+            if (strcmp(seg->segname, "__PAGEZERO") == 0) {
+                cursor += lc->cmdsize;
+                continue;
+            }
+            uintptr_t start = (uintptr_t)(seg->vmaddr + (uint64_t)slide);
+            uintptr_t end = start + (uintptr_t)seg->vmsize;
+            uintptr_t target = (uintptr_t)addr;
+            if (target >= start && target < end) {
+                if (!writableOnly) return true;
+                return (seg->initprot & VM_PROT_WRITE) != 0;
+            }
+        }
+        cursor += lc->cmdsize;
+    }
+    return false;
+}
+
+// Overwrite the words of the image that currently hold `expected`. Used as the
+// version independent way of finding __mainBundle: no disassembly involved, and
+// nothing is written unless the old value matches exactly.
+static int LCPatchCFBundleSlotsInImage(const struct mach_header_64 *mh, void *expected, void *replacement) {
+    if (!mh || !expected || !replacement || expected == replacement) return 0;
+    intptr_t slide = LCImageSlide(mh);
+    int patched = 0;
+    const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < mh->ncmds && patched < 8; i++) {
+        const struct load_command *lc = (const struct load_command *)cursor;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cursor;
+            // __AUTH* store ptrauth-signed pointers: writing a raw pointer there
+            // breaks the next authenticated load instead of fixing anything.
+            bool usable = (seg->initprot & VM_PROT_WRITE) != 0 &&
+                          strncmp(seg->segname, "__AUTH", 6) != 0 &&
+                          strcmp(seg->segname, "__PAGEZERO") != 0;
+            if (usable) {
+                void **slots = (void **)(uintptr_t)(seg->vmaddr + (uint64_t)slide);
+                uintptr_t count = (uintptr_t)(seg->vmsize / sizeof(void *));
+                for (uintptr_t k = 0; k < count && patched < 8; k++) {
+                    if (slots[k] == expected) {
+                        slots[k] = replacement;
+                        patched++;
+                    }
+                }
+            }
+        }
+        cursor += lc->cmdsize;
+    }
+    return patched;
+}
+
 void overwriteMainCFBundle(void) {
+    void *newCFBundle = (__bridge void *)NSBundle.mainBundle._cfBundle;
+    void *mainCFBundle = (void *)CFBundleGetMainBundle();
+    if (!newCFBundle || !mainCFBundle || newCFBundle == mainCFBundle) {
+        return;
+    }
+
     // Overwrite CFBundleGetMainBundle
     uint32_t *pc = (uint32_t *)CFBundleGetMainBundle;
     void **mainBundleAddr = 0;
-    
+
 #if !TARGET_OS_SIMULATOR
     if(@available(iOS 27.0, *)) {
         // at least in iOS 27.0 db1, the logic is inversed and the __mainBundle is right after the first tbz instruction
-        while (true) {
+        for (int i = 0; i < 4096; i++) {
             bool isTbz = ((*pc) & 0x7F000000) == 0x36000000;
             if (isTbz) {
                 // adrp <- pc-1
@@ -129,7 +233,7 @@ void overwriteMainCFBundle(void) {
         }
     } else {
 #endif
-        while (true) {
+        for (int i = 0; i < 4096; i++) {
             uint64_t addr = aarch64_get_tbnz_jump_address(*pc, (uint64_t)pc);
             if (addr) {
                 // adrp <- pc-1
@@ -144,8 +248,30 @@ void overwriteMainCFBundle(void) {
 #if !TARGET_OS_SIMULATOR
     }
 #endif
-    assert(mainBundleAddr != NULL);
-    *mainBundleAddr = (__bridge void *)NSBundle.mainBundle._cfBundle;
+
+    // Only accept the slot when it really is __mainBundle, i.e. it still holds
+    // the bundle CoreFoundation is handing out right now.
+    if (mainBundleAddr && *mainBundleAddr == mainCFBundle) {
+        *mainBundleAddr = newCFBundle;
+        return;
+    }
+
+    if (mainBundleAddr) {
+        NSLog(@"[LC] CFBundleGetMainBundle pattern resolved to %p holding %p (main bundle is %p), using value scan",
+              mainBundleAddr, *mainBundleAddr, mainCFBundle);
+    }
+
+    Dl_info info;
+    if (dladdr((const void *)CFBundleGetMainBundle, &info) == 0 || !info.dli_fbase) {
+        NSLog(@"[LC] unable to locate the CoreFoundation image, CFBundleGetMainBundle left untouched");
+        return;
+    }
+    const struct mach_header_64 *cfHeader = (const struct mach_header_64 *)info.dli_fbase;
+    if (mainBundleAddr && !LCAddressIsInImageSegment(cfHeader, mainBundleAddr, true)) {
+        NSLog(@"[LC] CFBundleGetMainBundle pattern pointed outside CoreFoundation (%p), ignoring it", mainBundleAddr);
+    }
+    int patched = LCPatchCFBundleSlotsInImage(cfHeader, mainCFBundle, newCFBundle);
+    NSLog(@"[LC] CFBundleGetMainBundle patched %d slot(s) by value scan", patched);
 }
 
 void overwriteMainNSBundle(NSBundle *newBundle) {
@@ -347,35 +473,53 @@ static void LCGuardedZoneFreeEarly(malloc_zone_t *zone, void *p) {
     malloc_zone_free(zone ? zone : malloc_default_zone(), p);
 }
 
-// Overwrite every GOT slot of the image whose resolved value equals
-// dlsym(symbolName) with replacement. Needs no symbol tables, therefore
-// works for chained-fixups binaries where fishhook's classic pass no-ops.
+// arm64e pointers carry a ptrauth signature in their top bits; strip it before
+// comparing a GOT slot against a resolved address. Plain arm64 is unaffected.
+static inline uintptr_t LCStripPointer(void *ptr) {
+#if __has_feature(ptrauth_calls)
+    return (uintptr_t)ptrauth_strip(ptr, ptrauth_key_asia);
+#else
+    return (uintptr_t)ptr & 0xFFFFFFFFFFFFULL;
+#endif
+}
+
+// Overwrite every GOT slot of the image whose resolved value equals target.
+// Needs no symbol tables, therefore works for chained-fixups binaries where
+// fishhook's classic pass no-ops.
+//
+// target is resolved by the caller on purpose. This runs from an add-image
+// callback, where dyld is walking its image list; a dlsym() from there can pull
+// in another image mid-walk and leave dyld holding headers it never finished
+// setting up. That kind of damage surfaces much later as unrelated traps - e.g.
+// SwiftUI body evaluation branching into __TEXT padding, or SIGBUS while reading
+// a String whose storage points at a region that was never mapped.
+//
+// __AUTH / __AUTH_CONST segments and __auth_got sections are skipped: their
+// slots hold ptrauth-signed pointers, and a raw replacement written there traps
+// on the next braa/blraa.
 void LCOverwriteGotSlotsInImage(const struct mach_header *mh, intptr_t slide,
-                                const char *symbolName, void *replacement) {
-    if (mh->magic != MH_MAGIC_64) return;
-    void *target = dlsym(RTLD_DEFAULT, symbolName);
-    if (!target) return;
-    uintptr_t targetClean = (uintptr_t)target & 0x7FFFFFFFFFFFULL;
+                                void *target, void *replacement) {
+    if (!mh || mh->magic != MH_MAGIC_64 || !target || !replacement) return;
+    if (target == replacement) return;
+    uintptr_t targetClean = LCStripPointer(target);
     const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < mh->ncmds; i++) {
         const struct load_command *lc = (const struct load_command *)cursor;
         if (lc->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *seg = (const struct segment_command_64 *)cursor;
             if (strcmp(seg->segname, "__DATA") != 0 &&
-                strcmp(seg->segname, "__DATA_CONST") != 0 &&
-                strcmp(seg->segname, "__AUTH") != 0 &&
-                strcmp(seg->segname, "__AUTH_CONST") != 0) {
+                strcmp(seg->segname, "__DATA_CONST") != 0) {
                 cursor += lc->cmdsize;
                 continue;
             }
             const struct section_64 *sections = (const struct section_64 *)(cursor + sizeof(struct segment_command_64));
             for (uint32_t s = 0; s < seg->nsects; s++) {
                 const struct section_64 *sect = &sections[s];
+                if (strncmp(sect->sectname, "__auth", 6) == 0) continue;
                 uint8_t type = sect->flags & SECTION_TYPE;
                 bool isGot = (type == S_NON_LAZY_SYMBOL_POINTERS ||
                               type == S_LAZY_SYMBOL_POINTERS ||
                               strncmp(sect->sectname, "__got", 5) == 0 ||
-                              strncmp(sect->sectname, "__auth_got", 10) == 0 ||
                               strncmp(sect->sectname, "__nl_symbol_ptr", 15) == 0 ||
                               strncmp(sect->sectname, "__la_symbol_ptr", 15) == 0);
                 if (!isGot) continue;
@@ -386,8 +530,7 @@ void LCOverwriteGotSlotsInImage(const struct mach_header *mh, intptr_t slide,
                                               VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
                 if (kr != KERN_SUCCESS) continue;
                 for (uintptr_t k = 0; k < sect->size / sizeof(void *); k++) {
-                    uintptr_t slotClean = (uintptr_t)slots[k] & 0x7FFFFFFFFFFFULL;
-                    if (slotClean == targetClean || slots[k] == target) {
+                    if (slots[k] == target || LCStripPointer(slots[k]) == targetClean) {
                         slots[k] = replacement;
                     }
                 }
@@ -397,19 +540,47 @@ void LCOverwriteGotSlotsInImage(const struct mach_header *mh, intptr_t slide,
     }
 }
 
+// Symbol addresses are resolved once, before the add-image callback is
+// registered, so that no dyld lookup happens from inside it.
+typedef struct {
+    void *platformCheck;
+    void *availabilityCheck;
+    void *freeGuard;
+    void *zoneFreeGuard;
+    bool resolved;
+} LCGuardTargets;
+
+static LCGuardTargets gLCGuardTargets;
+
+static bool LCGuardTargetsResolve(void) {
+    if (gLCGuardTargets.resolved) return true;
+    // leading underscores are part of the C symbol name here
+    gLCGuardTargets.platformCheck = dlsym(RTLD_DEFAULT, "__isPlatformVersionAtLeast");
+    if (!gLCGuardTargets.platformCheck) {
+        gLCGuardTargets.platformCheck = dlsym(RTLD_DEFAULT, "___isPlatformVersionAtLeast");
+    }
+    gLCGuardTargets.availabilityCheck = dlsym(RTLD_DEFAULT, "availability_version_check");
+    if (!gLCGuardTargets.availabilityCheck) {
+        gLCGuardTargets.availabilityCheck = dlsym(RTLD_DEFAULT, "_availability_version_check");
+    }
+    gLCGuardTargets.freeGuard = dlsym(RTLD_DEFAULT, "free");
+    gLCGuardTargets.zoneFreeGuard = dlsym(RTLD_DEFAULT, "malloc_zone_free");
+    gLCGuardTargets.resolved = true;
+    return gLCGuardTargets.platformCheck || gLCGuardTargets.availabilityCheck;
+}
+
 static void LCGuardGuestImageEarly(const struct mach_header *mh, intptr_t slide) {
+    if (!gLCGuardTargets.resolved) return;
     Dl_info info;
     if (!dladdr((const void *)mh, &info) || !info.dli_fname) return;
     const char *path = info.dli_fname;
     if (!path) return;
     // Only patch guest app images and tweaks; LC's own images keep real answers.
     if (!strstr(path, "/Documents/Applications/") && !strstr(path, "/Documents/Tweaks/")) return;
-    LCOverwriteGotSlotsInImage(mh, slide, "__isPlatformVersionAtLeast", (void *)LCLegacyPlatformVersionCheck);
-    LCOverwriteGotSlotsInImage(mh, slide, "___isPlatformVersionAtLeast", (void *)LCLegacyPlatformVersionCheck);
-    LCOverwriteGotSlotsInImage(mh, slide, "_availability_version_check", (void *)LCLegacyAvailabilityCheck);
-    LCOverwriteGotSlotsInImage(mh, slide, "availability_version_check", (void *)LCLegacyAvailabilityCheck);
-    LCOverwriteGotSlotsInImage(mh, slide, "free", (void *)LCGuardedFreeEarly);
-    LCOverwriteGotSlotsInImage(mh, slide, "malloc_zone_free", (void *)LCGuardedZoneFreeEarly);
+    LCOverwriteGotSlotsInImage(mh, slide, gLCGuardTargets.platformCheck, (void *)LCLegacyPlatformVersionCheck);
+    LCOverwriteGotSlotsInImage(mh, slide, gLCGuardTargets.availabilityCheck, (void *)LCLegacyAvailabilityCheck);
+    LCOverwriteGotSlotsInImage(mh, slide, gLCGuardTargets.freeGuard, (void *)LCGuardedFreeEarly);
+    LCOverwriteGotSlotsInImage(mh, slide, gLCGuardTargets.zoneFreeGuard, (void *)LCGuardedZoneFreeEarly);
     NSLog(@"[LC] guest image guarded pre-init: %s", path);
 }
 
@@ -417,6 +588,16 @@ static void LCInstallGuestAllocatorGuard(void) {
     static bool installed = false;
     if (installed) return;
     installed = true;
+    // Escape hatch for builds where the guard itself is suspected: set
+    // dontGuardGuestImages in the app's LCAppInfo.plist.
+    if ([guestAppInfo[@"dontGuardGuestImages"] boolValue]) {
+        NSLog(@"[LC] guest allocator guard disabled by LCAppInfo");
+        return;
+    }
+    if (!LCGuardTargetsResolve()) {
+        NSLog(@"[LC] guest allocator guard skipped: symbols not resolvable");
+        return;
+    }
     // Fires immediately for all images loaded so far (LC's own - filtered out
     // by path) and for every image added later, before its initializers run.
     _dyld_register_func_for_add_image(LCGuardGuestImageEarly);
