@@ -62,6 +62,11 @@ static int LCLegacyAvailabilityCheck(uint32_t count, void *args) {
     return 0;
 }
 
+static int LCLegacyPlatformVersionCheck(uint32_t platform, uint32_t major, uint32_t minor, uint32_t subminor) {
+    if (major >= 16) return 0;
+    return 1;
+}
+
 // Duplicated from LCBootstrap.m (this is a separate image): overwrite every
 // GOT slot whose resolved value equals dlsym(symbolName). Chained-fixups
 // binaries have empty indirect symbol tables, so the fishhook pass above
@@ -71,16 +76,30 @@ static void LCOverwriteGotSlotsLocal(const struct mach_header *mh, intptr_t slid
     if (mh->magic != MH_MAGIC_64) return;
     void *target = dlsym(RTLD_DEFAULT, symbolName);
     if (!target) return;
+    uintptr_t targetClean = (uintptr_t)target & 0x7FFFFFFFFFFFULL;
     const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < mh->ncmds; i++) {
         const struct load_command *lc = (const struct load_command *)cursor;
         if (lc->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *seg = (const struct segment_command_64 *)cursor;
+            if (strcmp(seg->segname, "__DATA") != 0 &&
+                strcmp(seg->segname, "__DATA_CONST") != 0 &&
+                strcmp(seg->segname, "__AUTH") != 0 &&
+                strcmp(seg->segname, "__AUTH_CONST") != 0) {
+                cursor += lc->cmdsize;
+                continue;
+            }
             const struct section_64 *sections = (const struct section_64 *)(cursor + sizeof(struct segment_command_64));
             for (uint32_t s = 0; s < seg->nsects; s++) {
                 const struct section_64 *sect = &sections[s];
                 uint8_t type = sect->flags & SECTION_TYPE;
-                if (type != S_NON_LAZY_SYMBOL_POINTERS && type != S_LAZY_SYMBOL_POINTERS) continue;
+                bool isGot = (type == S_NON_LAZY_SYMBOL_POINTERS ||
+                              type == S_LAZY_SYMBOL_POINTERS ||
+                              strncmp(sect->sectname, "__got", 5) == 0 ||
+                              strncmp(sect->sectname, "__auth_got", 10) == 0 ||
+                              strncmp(sect->sectname, "__nl_symbol_ptr", 15) == 0 ||
+                              strncmp(sect->sectname, "__la_symbol_ptr", 15) == 0);
+                if (!isGot) continue;
                 if (sect->size == 0 || sect->size > 0x100000) continue;
                 void **slots = (void **)(uintptr_t)(sect->addr + slide);
                 kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)(uintptr_t)slots,
@@ -88,7 +107,8 @@ static void LCOverwriteGotSlotsLocal(const struct mach_header *mh, intptr_t slid
                                               VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
                 if (kr != KERN_SUCCESS) continue;
                 for (uintptr_t k = 0; k < sect->size / sizeof(void *); k++) {
-                    if (slots[k] == target) {
+                    uintptr_t slotClean = (uintptr_t)slots[k] & 0x7FFFFFFFFFFFULL;
+                    if (slotClean == targetClean || slots[k] == target) {
                         slots[k] = replacement;
                     }
                 }
@@ -109,11 +129,17 @@ static void LCGuardGuestImages(const struct mach_header *mh, intptr_t slide) {
         { "free", (void *)LCGuardedFree, NULL },
         { "malloc_zone_free", (void *)LCGuardedZoneFree, NULL },
         { "availability_version_check", (void *)LCLegacyAvailabilityCheck, NULL },
+        { "_availability_version_check", (void *)LCLegacyAvailabilityCheck, NULL },
+        { "__isPlatformVersionAtLeast", (void *)LCLegacyPlatformVersionCheck, NULL },
+        { "___isPlatformVersionAtLeast", (void *)LCLegacyPlatformVersionCheck, NULL },
     };
     rebind_symbols_image((void *)mh, slide, rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
     // Chained-fixups images (all modern apps/tweaks) have empty indirect
     // symbol tables and the fishhook pass above no-ops for them; patch by
     // resolved value instead. Idempotent with LCBootstrap.m's pre-init pass.
+    LCOverwriteGotSlotsLocal(mh, slide, "__isPlatformVersionAtLeast", (void *)LCLegacyPlatformVersionCheck);
+    LCOverwriteGotSlotsLocal(mh, slide, "___isPlatformVersionAtLeast", (void *)LCLegacyPlatformVersionCheck);
+    LCOverwriteGotSlotsLocal(mh, slide, "_availability_version_check", (void *)LCLegacyAvailabilityCheck);
     LCOverwriteGotSlotsLocal(mh, slide, "availability_version_check", (void *)LCLegacyAvailabilityCheck);
     LCOverwriteGotSlotsLocal(mh, slide, "free", (void *)LCGuardedFree);
     LCOverwriteGotSlotsLocal(mh, slide, "malloc_zone_free", (void *)LCGuardedZoneFree);

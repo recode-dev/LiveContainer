@@ -291,6 +291,11 @@ static int LCLegacyAvailabilityCheck(uint32_t count, void *versions) {
     return 0;
 }
 
+static int LCLegacyPlatformVersionCheck(uint32_t platform, uint32_t major, uint32_t minor, uint32_t subminor) {
+    if (major >= 16) return 0;
+    return 1;
+}
+
 static void LCGuardedFreeEarly(void *p) {
     if (!p) return;
     if (malloc_size(p) == 0) return; // not a live allocation start: leak instead of abort
@@ -312,16 +317,30 @@ void LCOverwriteGotSlotsInImage(const struct mach_header *mh, intptr_t slide,
     if (mh->magic != MH_MAGIC_64) return;
     void *target = dlsym(RTLD_DEFAULT, symbolName);
     if (!target) return;
+    uintptr_t targetClean = (uintptr_t)target & 0x7FFFFFFFFFFFULL;
     const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < mh->ncmds; i++) {
         const struct load_command *lc = (const struct load_command *)cursor;
         if (lc->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *seg = (const struct segment_command_64 *)cursor;
+            if (strcmp(seg->segname, "__DATA") != 0 &&
+                strcmp(seg->segname, "__DATA_CONST") != 0 &&
+                strcmp(seg->segname, "__AUTH") != 0 &&
+                strcmp(seg->segname, "__AUTH_CONST") != 0) {
+                cursor += lc->cmdsize;
+                continue;
+            }
             const struct section_64 *sections = (const struct section_64 *)(cursor + sizeof(struct segment_command_64));
             for (uint32_t s = 0; s < seg->nsects; s++) {
                 const struct section_64 *sect = &sections[s];
                 uint8_t type = sect->flags & SECTION_TYPE;
-                if (type != S_NON_LAZY_SYMBOL_POINTERS && type != S_LAZY_SYMBOL_POINTERS) continue;
+                bool isGot = (type == S_NON_LAZY_SYMBOL_POINTERS ||
+                              type == S_LAZY_SYMBOL_POINTERS ||
+                              strncmp(sect->sectname, "__got", 5) == 0 ||
+                              strncmp(sect->sectname, "__auth_got", 10) == 0 ||
+                              strncmp(sect->sectname, "__nl_symbol_ptr", 15) == 0 ||
+                              strncmp(sect->sectname, "__la_symbol_ptr", 15) == 0);
+                if (!isGot) continue;
                 if (sect->size == 0 || sect->size > 0x100000) continue;
                 void **slots = (void **)(uintptr_t)(sect->addr + slide);
                 kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)(uintptr_t)slots,
@@ -329,7 +348,8 @@ void LCOverwriteGotSlotsInImage(const struct mach_header *mh, intptr_t slide,
                                               VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
                 if (kr != KERN_SUCCESS) continue;
                 for (uintptr_t k = 0; k < sect->size / sizeof(void *); k++) {
-                    if (slots[k] == target) {
+                    uintptr_t slotClean = (uintptr_t)slots[k] & 0x7FFFFFFFFFFFULL;
+                    if (slotClean == targetClean || slots[k] == target) {
                         slots[k] = replacement;
                     }
                 }
@@ -340,17 +360,7 @@ void LCOverwriteGotSlotsInImage(const struct mach_header *mh, intptr_t slide,
 }
 
 // Belt-and-suspenders backup pinned to the exact game binary from crash
-// reports #2-#6. Disassembly of blackrussia-client
-// (UUID 855846c3-4f72-3770-b811-dd7fbe68b0db):
-//   operator new @0xF1200 / operator delete @0xF1060 both do:
-//     ldarb w8, [0x1B0C5D8]   ; Itanium __cxa_guard
-//     tbz   w8, #0, ...       ; bit0 == 0 -> run lazy config ctor
-//     ldrb  w8, [0x1B0C599]   ; allocator mode
-//     cmp   w8, #1            ; mode 1 -> plain malloc/free
-//     b.ne  pool path         ; else -> malloc(size+0x10) header pool
-// Pre-initializing the guard (bit0 = "done") and the mode byte (1) skips the
-// lazy ctor entirely and makes the engine allocate exactly like on a stock
-// install with an old SDK.
+// reports #2-#6. Disassembly of blackrussia-client:
 #define LC_BR_UUID_HEX "855846c34f723770b811dd7fbe68b0db"
 static const uint8_t LC_BR_Znwm_SIG[16] = {
     0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9,
@@ -361,7 +371,11 @@ static const uint8_t LC_BR_ZdlPv_SIG[16] = {
 
 static void LCForceBlackRussiaLegacyAllocator(const struct mach_header *mh, intptr_t slide) {
     if (mh->magic != MH_MAGIC_64) return;
-    bool uuidOk = false;
+    Dl_info info;
+    if (!dladdr((const void *)mh, &info) || !info.dli_fname) return;
+    if (!strstr(info.dli_fname, "blackrussia")) return;
+
+    bool oldUuid = false;
     const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < mh->ncmds; i++) {
         const struct load_command *lc = (const struct load_command *)cursor;
@@ -374,32 +388,41 @@ static void LCForceBlackRussiaLegacyAllocator(const struct mach_header *mh, intp
                 hex[b * 2 + 1] = digits[u[b] & 0xf];
             }
             hex[32] = '\0';
-            uuidOk = strcmp(hex, LC_BR_UUID_HEX) == 0;
+            oldUuid = (strcmp(hex, LC_BR_UUID_HEX) == 0);
             break;
         }
         cursor += lc->cmdsize;
     }
-    if (!uuidOk) return;
-    // Prologue signatures pin the offsets; anything else -> do nothing.
-    if (memcmp((const void *)(uintptr_t)(slide + 0xF1200), LC_BR_Znwm_SIG, sizeof(LC_BR_Znwm_SIG)) != 0) return;
-    if (memcmp((const void *)(uintptr_t)(slide + 0xF1060), LC_BR_ZdlPv_SIG, sizeof(LC_BR_ZdlPv_SIG)) != 0) return;
-    volatile uint64_t *guard = (volatile uint64_t *)(uintptr_t)(slide + 0x1B0C5D8);
-    volatile uint8_t *mode = (volatile uint8_t *)(uintptr_t)(slide + 0x1B0C599);
-    if (*guard != 0) return; // lazy ctor already ran (not expected pre-init)
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)((uintptr_t)guard & ~0xfffULL),
-                                  0x4000, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) return;
-    *guard = 1; // __cxa_guard_acquire now returns 0: the lazy ctor never runs
-    *mode = 1;  // plain malloc/free allocator, identical to stock
-    NSLog(@"[LC] blackrussia-client allocator mode forced to legacy malloc/free (pre-init)");
+    if (oldUuid) {
+        if (memcmp((const void *)(uintptr_t)(slide + 0xF1200), LC_BR_Znwm_SIG, sizeof(LC_BR_Znwm_SIG)) == 0 &&
+            memcmp((const void *)(uintptr_t)(slide + 0xF1060), LC_BR_ZdlPv_SIG, sizeof(LC_BR_ZdlPv_SIG)) == 0) {
+            volatile uint64_t *guard = (volatile uint64_t *)(uintptr_t)(slide + 0x1B0C5D8);
+            volatile uint8_t *mode = (volatile uint8_t *)(uintptr_t)(slide + 0x1B0C599);
+            if (*guard == 0) {
+                kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)((uintptr_t)guard & ~0xfffULL),
+                                              0x4000, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                if (kr == KERN_SUCCESS) {
+                    *guard = 1;
+                    *mode = 1;
+                    NSLog(@"[LC] blackrussia-client allocator mode forced to legacy malloc/free (pinned offsets)");
+                    return;
+                }
+            }
+        }
+    }
+    NSLog(@"[LC] blackrussia-client detected (%s), platform check rebind active", info.dli_fname);
 }
 
 static void LCGuardGuestImageEarly(const struct mach_header *mh, intptr_t slide) {
     Dl_info info;
     if (!dladdr((const void *)mh, &info) || !info.dli_fname) return;
     const char *path = info.dli_fname;
+    if (!path) return;
     // Only patch guest app images and tweaks; LC's own images keep real answers.
     if (!strstr(path, "/Documents/Applications/") && !strstr(path, "/Documents/Tweaks/")) return;
+    LCOverwriteGotSlotsInImage(mh, slide, "__isPlatformVersionAtLeast", (void *)LCLegacyPlatformVersionCheck);
+    LCOverwriteGotSlotsInImage(mh, slide, "___isPlatformVersionAtLeast", (void *)LCLegacyPlatformVersionCheck);
+    LCOverwriteGotSlotsInImage(mh, slide, "_availability_version_check", (void *)LCLegacyAvailabilityCheck);
     LCOverwriteGotSlotsInImage(mh, slide, "availability_version_check", (void *)LCLegacyAvailabilityCheck);
     LCOverwriteGotSlotsInImage(mh, slide, "free", (void *)LCGuardedFreeEarly);
     LCOverwriteGotSlotsInImage(mh, slide, "malloc_zone_free", (void *)LCGuardedZoneFreeEarly);
@@ -411,6 +434,15 @@ static void LCInstallGuestAllocatorGuard(void) {
     static bool installed = false;
     if (installed) return;
     installed = true;
+    void *pIsPlatformVersionAtLeast = dlsym(RTLD_DEFAULT, "__isPlatformVersionAtLeast");
+    if (pIsPlatformVersionAtLeast) {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, pIsPlatformVersionAtLeast, (void *)LCLegacyPlatformVersionCheck, NULL);
+    }
+    void *pAvailabilityVersionCheck = dlsym(RTLD_DEFAULT, "_availability_version_check");
+    if (!pAvailabilityVersionCheck) pAvailabilityVersionCheck = dlsym(RTLD_DEFAULT, "availability_version_check");
+    if (pAvailabilityVersionCheck) {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, pAvailabilityVersionCheck, (void *)LCLegacyAvailabilityCheck, NULL);
+    }
     // Fires immediately for all images loaded so far (LC's own - filtered out
     // by path) and for every image added later, before its initializers run.
     _dyld_register_func_for_add_image(LCGuardGuestImageEarly);
