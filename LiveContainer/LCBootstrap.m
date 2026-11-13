@@ -647,15 +647,17 @@ static void LCForceLegacyAllocatorMode(const struct mach_header *mh, intptr_t sl
 // branches its own build never exercised, and that is the List<>.init(content:)
 // trap reported for the SwiftUI guests. Swift metadata is the dividing line and
 // it is visible in the image itself, so nothing is listed by name.
-// "Old" forces the legacy answers for every guest image; "New" keeps them for
-// the images that need them and leaves Swift ones alone. Exposed in the
-// 5-tap developer section of Settings.
-static bool LCGuestLegacyModeEnabled(void) {
+// Guest compatibility mode, chosen in the 5-tap developer section of Settings:
+//   0 Auto (default) - decide per image, see LCGuestSpoofAvailableForImage
+//   1 New            - truthful answers to every guest image
+//   2 Old            - legacy answers to every guest image
+static int LCGuestMode(void) {
     static int cached = -1;
     if (cached < 0) {
-        cached = [NSUserDefaults.standardUserDefaults boolForKey:@"LCGuestLegacyMode"] ? 1 : 0;
+        cached = (int)[NSUserDefaults.standardUserDefaults integerForKey:@"LCGuestMode"];
+        if (cached < 0 || cached > 2) cached = 0;
     }
-    return cached == 1;
+    return cached;
 }
 
 static bool LCImageHasSwiftMetadata(const struct mach_header *mh) {
@@ -699,6 +701,19 @@ static int LCLegacyPlatformVersionCheck(uint32_t platform, uint32_t major, uint3
     return 1;
 }
 
+// Auto decides per image. An engine's allocator mode only matters for the
+// bundled C/C++ framework it lives in, so a .framework image gets the legacy
+// answer; a Swift app executable is the one that must not be lied to, because
+// falsified availability sends it down branches its build never exercised.
+// That is the rule the working build had in practice, without a per-app list.
+static bool LCGuestSpoofAvailableForImage(const struct mach_header *mh, const char *path) {
+    int mode = LCGuestMode();
+    if (mode == 1) return false; // New: truthful for everyone
+    if (mode == 2) return true;  // Old: legacy for everyone
+    if (path && strstr(path, ".framework/")) return true;
+    return !LCImageHasSwiftMetadata(mh);
+}
+
 static void LCGuardGuestImageEarly(const struct mach_header *mh, intptr_t slide) {
     Dl_info info;
     if (!dladdr((const void *)mh, &info) || !info.dli_fname) return;
@@ -706,9 +721,8 @@ static void LCGuardGuestImageEarly(const struct mach_header *mh, intptr_t slide)
     // Only patch guest app images and tweaks; LC's own images keep real answers.
     if (!strstr(path, "/Documents/Applications/") && !strstr(path, "/Documents/Tweaks/")) return;
     LCOverwriteGotSlotsInImage(mh, slide, "availability_version_check", (void *)LCLegacyAvailabilityCheck);
-    if (!LCGuestLegacyModeEnabled() && LCImageHasSwiftMetadata(mh)) {
-        // Swift guest: hands off the inline checks (see LCImageHasSwiftMetadata).
-        NSLog(@"[LC] guest image is Swift, availability left untouched: %s", path);
+    if (!LCGuestSpoofAvailableForImage(mh, path)) {
+        NSLog(@"[LC] availability left truthful for this image (mode %d): %s", LCGuestMode(), path);
     } else {
         LCOverwriteGotSlotsInImage(mh, slide, "__isPlatformVersionAtLeast", (void *)LCLegacyPlatformVersionCheck);
         LCOverwriteGotSlotsInImage(mh, slide, "___isPlatformVersionAtLeast", (void *)LCLegacyPlatformVersionCheck);

@@ -60,7 +60,7 @@ struct LCSettingsView: View {
     
     @State var store : Store = .Unknown
     
-    @AppStorage("LCGuestLegacyMode") var guestLegacyMode = false
+    @AppStorage("LCGuestMode") var guestMode: Int = 0
     @AppStorage("LCLoadTweaksToSelf") var injectToLCItelf = false
     @AppStorage("LCIgnoreJITOnLaunch") var ignoreJITOnLaunch = false
     @AppStorage("LCSelected32BitEmulator", store: LCUtils.appGroupUserDefault) var selected32BitEmulator : String = ""
@@ -322,9 +322,10 @@ struct LCSettingsView: View {
                 
                 if sharedModel.developerMode {
                     Section {
-                        Picker(selection: $guestLegacyMode) {
-                            Text("New").tag(false)
-                            Text("Old").tag(true)
+                        Picker(selection: $guestMode) {
+                            Text("Auto").tag(0)
+                            Text("New").tag(1)
+                            Text("Old").tag(2)
                         } label: {
                             Text("Mode")
                         }
@@ -335,8 +336,9 @@ struct LCSettingsView: View {
                         Text("""
                         What version of iOS guest apps are told they run on. LiveContainer loads a guest as a library instead of as the main app, so its C++ operator new/delete no longer replace the system ones; an engine that picks a pool allocator from the OS version then frees memory the system does not recognise ("pointer being freed was not allocated").
 
-                        New - only engines without Swift metadata are answered with an older version. Swift and SwiftUI apps get the real answer, so their own availability checks stay truthful.
-                        Old - every guest is answered with an older version. Use it for a legacy engine that still aborts; Swift apps may crash with it, because they then run code their build never exercised.
+                        Auto - decides per image: a bundled .framework (where a C/C++ engine lives) is answered with an older version, a Swift app executable gets the truth. This is what fixes engines while leaving SwiftUI apps alone.
+                        New - every guest is answered truthfully. Use it if a Swift app misbehaves under Auto.
+                        Old - every guest is answered with an older version. Use it if an engine still aborts under Auto; Swift apps may crash with it, because they then run code their build never exercised.
 
                         Applies the next time the guest app is launched.
                         """)
