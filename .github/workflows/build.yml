@@ -13,7 +13,7 @@ on:
 jobs:
   build:
     name: Build using xcodebuild command
-    runs-on: xcode-27
+    runs-on: xcode-26
     env:
       scheme: LiveContainer
       archive_path: archive
