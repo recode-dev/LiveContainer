@@ -339,59 +339,222 @@ void LCOverwriteGotSlotsInImage(const struct mach_header *mh, intptr_t slide,
     }
 }
 
-// Belt-and-suspenders backup pinned to the exact game binary from crash
-// reports #2-#6. Disassembly of blackrussia-client
-// (UUID 855846c3-4f72-3770-b811-dd7fbe68b0db):
-//   operator new @0xF1200 / operator delete @0xF1060 both do:
-//     ldarb w8, [0x1B0C5D8]   ; Itanium __cxa_guard
-//     tbz   w8, #0, ...       ; bit0 == 0 -> run lazy config ctor
-//     ldrb  w8, [0x1B0C599]   ; allocator mode
-//     cmp   w8, #1            ; mode 1 -> plain malloc/free
-//     b.ne  pool path         ; else -> malloc(size+0x10) header pool
-// Pre-initializing the guard (bit0 = "done") and the mode byte (1) skips the
-// lazy ctor entirely and makes the engine allocate exactly like on a stock
-// install with an old SDK.
-#define LC_BR_UUID_HEX "855846c34f723770b811dd7fbe68b0db"
-static const uint8_t LC_BR_Znwm_SIG[16] = {
-    0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9,
-    0xfd, 0x43, 0x00, 0x91, 0xf3, 0x03, 0x00, 0xaa };
-static const uint8_t LC_BR_ZdlPv_SIG[16] = {
-    0xff, 0x83, 0x00, 0xd1, 0xfd, 0x7b, 0x01, 0xa9,
-    0xfd, 0x43, 0x00, 0x91, 0xc8, 0xd0, 0x00, 0xf0 };
+// --- Allocator-mode pin, discovered instead of hardcoded -------------------
+//
+// An engine that decides its allocator at first use picks a 16-byte-header
+// pool when it believes it is on a new OS. Buffers from that pool are then
+// freed by shared-cache libc++ and abort with "pointer being freed was not
+// allocated". Setting the engine's own "allocator mode" byte to 1 (plain
+// malloc/free) and pre-marking its lazy-init guard before any initializer runs
+// makes it behave exactly like on a stock install, which is the fix.
+//
+// This used to be pinned to one build: LC_UUID == 855846c3 plus two hardcoded
+// offsets (0x1B0C5D8 / 0x1B0C599, functions at 0xF1200 / 0xF1060). Every app
+// update changes the UUID and moves everything, so the pin silently stopped
+// applying and the crash came back.
+//
+// The globals are now found from the code that reads them. operator new and
+// operator delete of that engine both contain
+//
+//     ldarb w8, [guard]     ; Itanium __cxa_guard
+//     tbz   w8, #0, slow    ; bit0 == 0 -> run the lazy config ctor
+//     ldrb  w9, [mode]      ; allocator mode
+//     cmp   w9, #1
+//     b.ne  pool            ; != 1 -> pool allocator
+//
+// so __text is walked for that shape, the adrp(+add) behind each load is
+// decoded to recover the global it touches, and the pair is only accepted when
+// two independent functions agree on the same two globals. Nothing is pinned
+// to a manifest, a UUID or an offset.
 
-static void LCForceBlackRussiaLegacyAllocator(const struct mach_header *mh, intptr_t slide) {
-    if (mh->magic != MH_MAGIC_64) return;
-    bool uuidOk = false;
+static inline bool lcIsLdarb(uint32_t insn) {
+    return (insn & 0xFFFFFC00) == 0x08DFFC00; // LDARB Wt, [Xn]
+}
+
+static inline bool lcIsTbz(uint32_t insn) {
+    // TBZ (b5 == 0), i.e. test bit 0..31
+    return (insn & 0x7F000000) == 0x36000000 && ((insn >> 24) & 1) == 0;
+}
+
+static inline bool lcIsLdrbImm(uint32_t insn) {
+    return (insn & 0xFFC00000) == 0x39400000; // LDRB Wt, [Xn, #imm]
+}
+
+static inline bool lcIsCmpImm(uint32_t insn, uint32_t imm) {
+    // SUBS WZR, Wn, #imm
+    return (insn & 0xFFC00000) == 0x71000000 &&
+           (insn & 0x1F) == 0x1F &&
+           ((insn >> 10) & 0xFFF) == imm;
+}
+
+static inline bool lcIsBCond(uint32_t insn) {
+    return (insn & 0xFF000010) == 0x54000000;
+}
+
+static inline bool lcIsAdrp(uint32_t insn) {
+    return (insn & 0x9F000000) == 0x90000000;
+}
+
+static inline bool lcIsAddImm(uint32_t insn) {
+    return (insn & 0xFF800000) == 0x91000000; // ADD Xd, Xn, #imm{, lsl #12}
+}
+
+static inline uint32_t lcInsnRd(uint32_t insn) { return insn & 0x1F; }
+static inline uint32_t lcInsnRn(uint32_t insn) { return (insn >> 5) & 0x1F; }
+
+// Recover the global a load instruction touches: find the adrp that formed its
+// base register within a short window, add the load's imm12.
+static void *lcResolveLoadTarget(const uint32_t *code, uint32_t count, uint32_t idx,
+                                 uint64_t codeVA, uint32_t baseReg) {
+    if (idx >= count) return NULL;
+    // LDARB carries no immediate (bits 21:10 are part of its opcode), only
+    // LDRB's imm12 is an offset.
+    uint32_t offset = lcIsLdrbImm(code[idx]) ? ((code[idx] >> 10) & 0xFFF) : 0;
+    for (uint32_t back = 1; back <= 12 && idx >= back; back++) {
+        uint32_t insn = code[idx - back];
+        if (!lcIsAdrp(insn) || lcInsnRd(insn) != baseReg) continue;
+        uint64_t page = aarch64_emulate_adrp(insn, codeVA + (uint64_t)(idx - back) * 4);
+        if (!page) return NULL;
+        // optional add between the adrp and the load
+        for (uint32_t mid = back - 1; mid >= 1; mid--) {
+            uint32_t add = code[idx - mid];
+            if (!lcIsAddImm(add)) continue;
+            if (lcInsnRd(add) != baseReg || lcInsnRn(add) != baseReg) continue;
+            uint64_t imm = (add >> 10) & 0xFFF;
+            if ((add >> 22) & 1) imm <<= 12;
+            return (void *)(uintptr_t)(page + imm + offset);
+        }
+        return (void *)(uintptr_t)(page + offset);
+    }
+    return NULL;
+}
+
+static bool lcAddressWritableInImage(const struct mach_header *mh, intptr_t slide, const void *addr) {
+    uintptr_t target = (uintptr_t)addr;
     const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < mh->ncmds; i++) {
         const struct load_command *lc = (const struct load_command *)cursor;
-        if (lc->cmd == LC_UUID) {
-            static const char digits[] = "0123456789abcdef";
-            char hex[33];
-            const uint8_t *u = cursor + sizeof(struct load_command);
-            for (int b = 0; b < 16; b++) {
-                hex[b * 2] = digits[u[b] >> 4];
-                hex[b * 2 + 1] = digits[u[b] & 0xf];
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cursor;
+            uintptr_t start = (uintptr_t)(seg->vmaddr + (uint64_t)slide);
+            if (target >= start && target < start + (uintptr_t)seg->vmsize) {
+                return (seg->initprot & VM_PROT_WRITE) != 0;
             }
-            hex[32] = '\0';
-            uuidOk = strcmp(hex, LC_BR_UUID_HEX) == 0;
-            break;
         }
         cursor += lc->cmdsize;
     }
-    if (!uuidOk) return;
-    // Prologue signatures pin the offsets; anything else -> do nothing.
-    if (memcmp((const void *)(uintptr_t)(slide + 0xF1200), LC_BR_Znwm_SIG, sizeof(LC_BR_Znwm_SIG)) != 0) return;
-    if (memcmp((const void *)(uintptr_t)(slide + 0xF1060), LC_BR_ZdlPv_SIG, sizeof(LC_BR_ZdlPv_SIG)) != 0) return;
-    volatile uint64_t *guard = (volatile uint64_t *)(uintptr_t)(slide + 0x1B0C5D8);
-    volatile uint8_t *mode = (volatile uint8_t *)(uintptr_t)(slide + 0x1B0C599);
-    if (*guard != 0) return; // lazy ctor already ran (not expected pre-init)
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)((uintptr_t)guard & ~0xfffULL),
-                                  0x4000, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    return false;
+}
+
+// Walk __text for the lazy-init + mode-check shape above. Two functions must
+// resolve to the same pair of globals before anything is written.
+static bool lcFindAllocatorModeGlobals(const struct mach_header *mh, intptr_t slide,
+                                       void **guardOut, void **modeOut) {
+    const uint32_t *text = NULL;
+    uint64_t textVA = 0, textBytes = 0;
+    const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < mh->ncmds && !text; i++) {
+        const struct load_command *lc = (const struct load_command *)cursor;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cursor;
+            if (strcmp(seg->segname, "__TEXT") == 0 || strcmp(seg->segname, "__TEXT_EXEC") == 0) {
+                const struct section_64 *sections = (const struct section_64 *)(cursor + sizeof(struct segment_command_64));
+                for (uint32_t s = 0; s < seg->nsects; s++) {
+                    if (strcmp(sections[s].sectname, "__text") == 0 && sections[s].size > 0x100) {
+                        text = (const uint32_t *)(uintptr_t)(sections[s].addr + (uint64_t)slide);
+                        textVA = sections[s].addr + (uint64_t)slide;
+                        textBytes = sections[s].size;
+                        break;
+                    }
+                }
+            }
+        }
+        cursor += lc->cmdsize;
+    }
+    if (!text || textBytes < 0x100) return false;
+
+    uint64_t count = textBytes / sizeof(uint32_t);
+    if (count > 0x1000000) count = 0x1000000; // cap: 64 MB of code
+
+    void *firstGuard = NULL, *firstMode = NULL;
+    void *tightGuard = NULL, *tightMode = NULL;
+    int seen = 0;
+    for (uint64_t i = 0; i + 24 < count; i++) {
+        if (!lcIsLdarb(text[i])) continue;
+
+        uint64_t tbz = 0;
+        for (uint64_t k = i + 1; k <= i + 4; k++) {
+            if (lcIsTbz(text[k])) { tbz = k; break; }
+        }
+        if (!tbz) continue;
+
+        uint64_t ldrb = 0, cmp = 0, bne = 0;
+        for (uint64_t k = tbz + 1; k <= tbz + 16; k++) {
+            if (!ldrb && lcIsLdrbImm(text[k])) { ldrb = k; continue; }
+            if (ldrb && !cmp && lcIsCmpImm(text[k], 1)) { cmp = k; continue; }
+            if (cmp && !bne && lcIsBCond(text[k])) { bne = k; break; }
+        }
+        if (!ldrb || !cmp || !bne) continue;
+
+        void *guard = lcResolveLoadTarget(text, (uint32_t)count, (uint32_t)i, textVA, lcInsnRn(text[i]));
+        void *mode = lcResolveLoadTarget(text, (uint32_t)count, (uint32_t)ldrb, textVA, lcInsnRn(text[ldrb]));
+        if (!guard || !mode || guard == mode) continue;
+
+        uintptr_t a = (uintptr_t)guard, b = (uintptr_t)mode;
+        uintptr_t delta = a > b ? a - b : b - a;
+        if (delta > 0x10000) continue;
+        if (!lcAddressWritableInImage(mh, slide, guard)) continue;
+        if (!lcAddressWritableInImage(mh, slide, mode)) continue;
+        if (*(volatile uint64_t *)guard != 0) continue; // lazy ctor already ran
+        if (*(volatile uint8_t *)mode > 1) continue;    // not an allocator mode byte
+
+        if (seen == 0) {
+            firstGuard = guard;
+            firstMode = mode;
+            seen = 1;
+        } else if (firstGuard == guard && firstMode == mode) {
+            // operator new and operator delete agree: this is the pair.
+            *guardOut = guard;
+            *modeOut = mode;
+            return true;
+        }
+
+        // A build where only one function carries the check is still
+        // recognisable: guard, test-bit-0, mode, cmp #1, b.ne back to back,
+        // with both fields in the same small struct.
+        bool tight = (tbz == i + 1) && (ldrb <= tbz + 4) && (cmp == ldrb + 1) && (bne == cmp + 1);
+        if (tight && !tightGuard && delta <= 0x200) {
+            tightGuard = guard;
+            tightMode = mode;
+        }
+    }
+
+    if (tightGuard && tightMode) {
+        *guardOut = tightGuard;
+        *modeOut = tightMode;
+        return true;
+    }
+    return false;
+}
+
+static void LCForceLegacyAllocatorMode(const struct mach_header *mh, intptr_t slide) {
+    if (mh->magic != MH_MAGIC_64) return;
+
+    void *guard = NULL, *mode = NULL;
+    if (!lcFindAllocatorModeGlobals(mh, slide, &guard, &mode)) {
+        return; // not this kind of engine; nothing to do
+    }
+
+    uintptr_t lo = ((uintptr_t)guard < (uintptr_t)mode ? (uintptr_t)guard : (uintptr_t)mode) & ~(uintptr_t)0xFFF;
+    uintptr_t hi = (((uintptr_t)guard > (uintptr_t)mode ? (uintptr_t)guard : (uintptr_t)mode) + 8 + 0xFFF) & ~(uintptr_t)0xFFF;
+    if (hi <= lo || hi - lo > 0x10000) return;
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)lo, (vm_size_t)(hi - lo), 0,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (kr != KERN_SUCCESS) return;
-    *guard = 1; // __cxa_guard_acquire now returns 0: the lazy ctor never runs
-    *mode = 1;  // plain malloc/free allocator, identical to stock
-    NSLog(@"[LC] blackrussia-client allocator mode forced to legacy malloc/free (pre-init)");
+
+    *(volatile uint64_t *)guard = 1; // __cxa_guard_acquire now returns 0: the lazy ctor never runs
+    *(volatile uint8_t *)mode = 1;   // plain malloc/free allocator, identical to stock
+    NSLog(@"[LC] guest allocator mode pinned to plain malloc/free (guard %p, mode %p)", guard, mode);
 }
 
 static void LCGuardGuestImageEarly(const struct mach_header *mh, intptr_t slide) {
@@ -403,7 +566,11 @@ static void LCGuardGuestImageEarly(const struct mach_header *mh, intptr_t slide)
     LCOverwriteGotSlotsInImage(mh, slide, "availability_version_check", (void *)LCLegacyAvailabilityCheck);
     LCOverwriteGotSlotsInImage(mh, slide, "free", (void *)LCGuardedFreeEarly);
     LCOverwriteGotSlotsInImage(mh, slide, "malloc_zone_free", (void *)LCGuardedZoneFreeEarly);
-    LCForceBlackRussiaLegacyAllocator(mh, slide);
+    // Only the guest executable itself can carry an allocator override; skip
+    // frameworks and tweaks so nothing else is scanned or touched.
+    if (!strstr(path, "/Frameworks/") && !strstr(path, "/Tweaks/")) {
+        LCForceLegacyAllocatorMode(mh, slide);
+    }
     NSLog(@"[LC] guest image guarded pre-init: %s", path);
 }
 
