@@ -6,6 +6,7 @@
 
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
+#include <mach-o/nlist.h>
 #include <mach-o/dyld_images.h>
 #include <objc/runtime.h>
 
@@ -714,6 +715,92 @@ static bool LCGuestSpoofAvailableForImage(const struct mach_header *mh, const ch
     return !LCImageHasSwiftMetadata(mh);
 }
 
+// ---------------------------------------------------------------------------
+// C++ allocation operators
+//
+// Why the engine aborts under LiveContainer but not as a normal app: a guest is
+// loaded as a library, after libc++abi is already bound, so the guest's strong
+// operator new/delete no longer replace the weak ones process-wide the way a
+// main executable's definitions do. The engine allocates with its own pool
+// operator new (pointer + 16-byte header) and the shared-cache libc++ frees it
+// with plain free() - "pointer being freed was not allocated".
+//
+// Answering availability checks differently only steers the engine towards its
+// plain mode; that worked in the build where the mode byte was pinned, and it is
+// why every availability-only attempt still aborted. The structural fix is to
+// put the allocations themselves on plain malloc/free, which is what a stock
+// install ends up doing: hook the guest's own operator new/delete when it
+// defines them. A pair is only hooked when both halves are present, otherwise
+// allocation and release would disagree again.
+// ---------------------------------------------------------------------------
+
+static void *lcPlainAlloc(size_t n) {
+    return malloc(n ? n : 1);
+}
+
+static void *lcPlainAllocAligned(size_t n, size_t align) {
+    void *p = NULL;
+    if (align < sizeof(void *)) align = sizeof(void *);
+    if (posix_memalign(&p, align, n ? n : 1) != 0) return NULL;
+    return p;
+}
+
+static void lcPlainRelease(void *p) {
+    free(p);
+}
+
+// Mach-O symbol names carry the leading underscore of the C symbol.
+static void *lcFindSymbolInImage(const struct mach_header_64 *mh, intptr_t slide, const char *name) {
+    const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cursor;
+        if (lc->cmd == LC_SYMTAB) {
+            const struct symtab_command *st = (const struct symtab_command *)cursor;
+            const struct nlist_64 *syms = (const struct nlist_64 *)((const uint8_t *)mh + st->symoff);
+            const char *strs = (const char *)mh + st->stroff;
+            for (uint32_t s = 0; s < st->nsyms; s++) {
+                if (syms[s].n_un.n_strx == 0) continue;
+                if ((syms[s].n_type & N_TYPE) != N_SECT) continue;
+                if (syms[s].n_value == 0) continue;
+                if (strcmp(strs + syms[s].n_un.n_strx, name) != 0) continue;
+                return (void *)(uintptr_t)(syms[s].n_value + (uint64_t)slide);
+            }
+        }
+        cursor += lc->cmdsize;
+    }
+    return NULL;
+}
+
+static void LCHookGuestAllocationOperators(const struct mach_header *mh, intptr_t slide, const char *path) {
+    const struct mach_header_64 *mh64 = (const struct mach_header_64 *)mh;
+    if (!mh64 || mh64->magic != MH_MAGIC_64) return;
+
+    void *znwm = lcFindSymbolInImage(mh64, slide, "__Znwm");
+    void *zdlpv = lcFindSymbolInImage(mh64, slide, "__ZdlPv");
+    if (!znwm || !zdlpv) {
+        return; // this image does not override the operators: nothing to align
+    }
+
+    kern_return_t rcDel = litehook_hook_function(zdlpv, (void *)lcPlainRelease);
+    kern_return_t rcNew = litehook_hook_function(znwm, (void *)lcPlainAlloc);
+    NSLog(@"[LC] guest allocation operators -> malloc/free (rc %d/%d): %s", (int)rcNew, (int)rcDel, path ? path : "?");
+
+    // Optional siblings, each pair handled on its own.
+    struct { const char *newSym; const char *delSym; bool aligned; } pairs[] = {
+        { "__Znam", "__ZdaPv", false },
+        { "__ZnwmSt11align_val_t", "__ZdlPvSt11align_val_t", true },
+        { "__ZnamSt11align_val_t", "__ZdaPvSt11align_val_t", true },
+        { "__ZnwmRKSt9nothrow_t", "__ZdlPvRKSt9nothrow_t", false },
+    };
+    for (unsigned i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+        void *n = lcFindSymbolInImage(mh64, slide, pairs[i].newSym);
+        void *d = lcFindSymbolInImage(mh64, slide, pairs[i].delSym);
+        if (!n || !d) continue;
+        litehook_hook_function(d, (void *)lcPlainRelease);
+        litehook_hook_function(n, pairs[i].aligned ? (void *)lcPlainAllocAligned : (void *)lcPlainAlloc);
+    }
+}
+
 static void LCGuardGuestImageEarly(const struct mach_header *mh, intptr_t slide) {
     Dl_info info;
     if (!dladdr((const void *)mh, &info) || !info.dli_fname) return;
@@ -729,6 +816,10 @@ static void LCGuardGuestImageEarly(const struct mach_header *mh, intptr_t slide)
     }
     LCOverwriteGotSlotsInImage(mh, slide, "free", (void *)LCGuardedFreeEarly);
     LCOverwriteGotSlotsInImage(mh, slide, "malloc_zone_free", (void *)LCGuardedZoneFreeEarly);
+    // Plain allocations first: the abort this fixes happens during the image's
+    // own initializers, before any of the availability answers matter.
+    LCHookGuestAllocationOperators(mh, slide, path);
+
     // The engine does not have to be the app executable: in the reported case
     // it is a framework inside the bundle (Frameworks/blackrussia-client),
     // which is why the pin has to run for every guest image, exactly like the
