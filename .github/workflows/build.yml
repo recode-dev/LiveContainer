@@ -13,7 +13,7 @@ on:
 jobs:
   build:
     name: Build using xcodebuild command
-    runs-on: xcode-26
+    runs-on: xcode-27
     env:
       scheme: LiveContainer
       archive_path: archive
@@ -23,9 +23,45 @@ jobs:
       artifact: ${{ env.scheme }}.ipa
       artifact2: ${{ env.scheme }}+SideStore.ipa
     steps:
-      - uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: 'latest-stable'
+      # The xcode-27 runner image ships several Xcodes (27.0 / 27.1 / 27.2 ...)
+      # and gains a new one on every image refresh, so any pinned version spec
+      # (setup-xcode@v1 with e.g. '26.2') kills the whole job as soon as the
+      # image moves on. Pick the newest installed Xcode instead - version
+      # agnostic, works on xcode-26 / xcode-27 / macos-latest alike.
+      - name: Select Xcode (newest installed)
+        id: xcode
+        run: |
+          set -uo pipefail
+          current="$(xcode-select -p 2>/dev/null || true)"
+          echo "Default developer dir: ${current:-<none>}"
+
+          # Python does the version sort: BSD/macOS `sort` has no portable -V,
+          # and a lexical sort ranks Xcode_27.app above Xcode_27.2.app.
+          best="$(/usr/bin/python3 - <<'PY'
+          import glob, re
+          def key(path):
+              m = re.search(r'Xcode_([0-9]+(?:\.[0-9]+)*)', path)
+              return tuple(int(x) for x in m.group(1).split('.')) if m else (0,)
+          apps = glob.glob('/Applications/Xcode*.app')
+          print(sorted(apps, key=key)[-1] if apps else '')
+          PY
+          )"
+          echo "Newest installed: ${best:-<none>}"
+
+          if [ -n "$best" ] && [ "$best/Contents/Developer" != "$current" ]; then
+            echo "Switching to $best"
+            # sudo -n never prompts: on a self-hosted runner a password prompt
+            # would hang the job until the timeout.
+            sudo -n xcode-select -s "$best" 2>/dev/null \
+              || xcode-select -s "$best" 2>/dev/null \
+              || echo "::warning::could not switch xcode-select to $best (keeping $current)"
+          fi
+
+          echo "Active developer dir: $(xcode-select -p)"
+          if ! xcodebuild -version; then
+            echo "::error::No usable Xcode toolchain on this runner"; exit 1
+          fi
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
       - name: Checkout
         uses: actions/checkout@v6
         with:
@@ -58,7 +94,15 @@ jobs:
           scheme: ${{ steps.scheme.outputs.scheme }}
           filetype_parameter: ${{ steps.filetype_parameter.outputs.filetype_parameter }}
           file_to_build: ${{ steps.file_to_build.outputs.file_to_build }}
-        run: xcodebuild archive -archivePath "$archive_path" -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -sdk iphoneos -arch arm64 -configuration Release | xcpretty && exit ${PIPESTATUS[0]}
+        run: |
+          set -uo pipefail
+          # xcpretty is optional on self-hosted runners; fall back to raw output.
+          if command -v xcpretty >/dev/null 2>&1; then
+            xcodebuild archive -archivePath "$archive_path" -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -sdk iphoneos -arch arm64 -configuration Release | xcpretty
+            exit ${PIPESTATUS[0]}
+          fi
+          xcodebuild archive -archivePath "$archive_path" -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -sdk iphoneos -arch arm64 -configuration Release
+
       - name: Tar Build Artifact
         run: tar -cvf "$archive_path.xcarchive.tar" "$archive_path.xcarchive"
       - name: Upload a Build Artifact
