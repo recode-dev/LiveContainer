@@ -448,8 +448,13 @@ static bool lcAddressWritableInImage(const struct mach_header *mh, intptr_t slid
 
 // Walk __text for the lazy-init + mode-check shape above. Two functions must
 // resolve to the same pair of globals before anything is written.
+// A launch has a finite budget for this walk: every guest image is scanned,
+// and a bundle can hold dozens of frameworks.
+static uint64_t gLCAllocatorScanBudget = 0x2000000ULL; // 32 M dwords = 128 MB of code
+
 static bool lcFindAllocatorModeGlobals(const struct mach_header *mh, intptr_t slide,
-                                       void **guardOut, void **modeOut) {
+                                       void **guardOut, void **modeOut,
+                                       uint64_t *textSizeOut) {
     const uint32_t *text = NULL;
     uint64_t textVA = 0, textBytes = 0;
     const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
@@ -473,14 +478,19 @@ static bool lcFindAllocatorModeGlobals(const struct mach_header *mh, intptr_t sl
     }
     if (!text || textBytes < 0x100) return false;
 
+    if (textSizeOut) *textSizeOut = textBytes;
     uint64_t count = textBytes / sizeof(uint32_t);
-    if (count > 0x1000000) count = 0x1000000; // cap: 64 MB of code
+    if (count > 0x1000000) count = 0x1000000; // cap: 64 MB of code per image
+    if (count > gLCAllocatorScanBudget) count = gLCAllocatorScanBudget;
+    gLCAllocatorScanBudget -= count;
 
     void *firstGuard = NULL, *firstMode = NULL;
     void *tightGuard = NULL, *tightMode = NULL;
     int seen = 0;
     for (uint64_t i = 0; i + 24 < count; i++) {
-        if (!lcIsLdarb(text[i])) continue;
+        // The guard load is an acquire byte load in the known builds; a rebuild
+        // may emit a plain one, so both anchor the search.
+        if (!lcIsLdarb(text[i]) && !lcIsLdrbImm(text[i])) continue;
 
         uint64_t tbz = 0;
         for (uint64_t k = i + 1; k <= i + 4; k++) {
@@ -541,8 +551,15 @@ static void LCForceLegacyAllocatorMode(const struct mach_header *mh, intptr_t sl
     if (mh->magic != MH_MAGIC_64) return;
 
     void *guard = NULL, *mode = NULL;
-    if (!lcFindAllocatorModeGlobals(mh, slide, &guard, &mode)) {
-        return; // not this kind of engine; nothing to do
+    uint64_t textSize = 0;
+    if (!lcFindAllocatorModeGlobals(mh, slide, &guard, &mode, &textSize)) {
+        // Say so for sizeable images only: that is where an engine lives, and
+        // a silent miss is exactly what made the previous pin fail quietly.
+        if (textSize >= 0x400000) {
+            NSLog(@"[LC] allocator scan: no match in a %llu KB __text",
+                  (unsigned long long)(textSize / 1024));
+        }
+        return;
     }
 
     uintptr_t lo = ((uintptr_t)guard < (uintptr_t)mode ? (uintptr_t)guard : (uintptr_t)mode) & ~(uintptr_t)0xFFF;
@@ -566,11 +583,11 @@ static void LCGuardGuestImageEarly(const struct mach_header *mh, intptr_t slide)
     LCOverwriteGotSlotsInImage(mh, slide, "availability_version_check", (void *)LCLegacyAvailabilityCheck);
     LCOverwriteGotSlotsInImage(mh, slide, "free", (void *)LCGuardedFreeEarly);
     LCOverwriteGotSlotsInImage(mh, slide, "malloc_zone_free", (void *)LCGuardedZoneFreeEarly);
-    // Only the guest executable itself can carry an allocator override; skip
-    // frameworks and tweaks so nothing else is scanned or touched.
-    if (!strstr(path, "/Frameworks/") && !strstr(path, "/Tweaks/")) {
-        LCForceLegacyAllocatorMode(mh, slide);
-    }
+    // The engine does not have to be the app executable: in the reported case
+    // it is a framework inside the bundle (Frameworks/blackrussia-client),
+    // which is why the pin has to run for every guest image, exactly like the
+    // old UUID check did.
+    LCForceLegacyAllocatorMode(mh, slide);
     NSLog(@"[LC] guest image guarded pre-init: %s", path);
 }
 
@@ -578,6 +595,7 @@ static void LCInstallGuestAllocatorGuard(void) {
     static bool installed = false;
     if (installed) return;
     installed = true;
+    gLCAllocatorScanBudget = 0x2000000ULL; // fresh budget per process
     // Fires immediately for all images loaded so far (LC's own - filtered out
     // by path) and for every image added later, before its initializers run.
     _dyld_register_func_for_add_image(LCGuardGuestImageEarly);
