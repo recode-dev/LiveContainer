@@ -326,9 +326,23 @@ struct LCSettingsView: View {
                             Text("New").tag(false)
                             Text("Old").tag(true)
                         } label: {
-                            Text("Guest mode")
+                            Text("Mode")
                         }
                         .pickerStyle(.segmented)
+                    } header: {
+                        Text("Guest Compatibility")
+                    } footer: {
+                        Text("""
+                        What version of iOS guest apps are told they run on. LiveContainer loads a guest as a library instead of as the main app, so its C++ operator new/delete no longer replace the system ones; an engine that picks a pool allocator from the OS version then frees memory the system does not recognise ("pointer being freed was not allocated").
+
+                        New - only engines without Swift metadata are answered with an older version. Swift and SwiftUI apps get the real answer, so their own availability checks stay truthful.
+                        Old - every guest is answered with an older version. Use it for a legacy engine that still aborts; Swift apps may crash with it, because they then run code their build never exercised.
+
+                        Applies the next time the guest app is launched.
+                        """)
+                    }
+
+                    Section {
                         Toggle(isOn: $injectToLCItelf) {
                             Text("lc.settings.injectLCItself".loc)
                         }
@@ -381,8 +395,7 @@ struct LCSettingsView: View {
                     } header: {
                         Text("Developer Settings")
                     } footer: {
-                        Text("lc.settings.injectLCItselfDesc".loc) +
-                        Text("\n\nGuest mode: New answers availability checks truthfully for Swift apps and only spoofs engines without Swift metadata. Old reports an older iOS to every guest image, which legacy engines need but Swift apps may not survive. Restart the guest app after changing it.")
+                        Text("lc.settings.injectLCItselfDesc".loc)
                     }
                 }
             }

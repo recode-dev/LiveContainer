@@ -462,6 +462,56 @@ static bool lcAddressWritableInImage(const struct mach_header *mh, intptr_t slid
     return false;
 }
 
+// Looser second pass, used only when the exact shape above is not found: a
+// byte load from a global that is still 0 followed by a tbz on bit 0 (the
+// Itanium lazy guard), then any byte load from a nearby global that is still 0
+// or 1 (the allocator mode), within the next 20 instructions. The compare is
+// not required here, because that is the instruction a rebuild is most likely
+// to change (cmp #1 vs cbz vs cmp #2). Two independent functions still have to
+// agree on the same pair, which is what keeps a lookalike from being patched.
+static bool lcFindAllocatorModeGlobalsLoose(const uint32_t *text, uint64_t count, uint64_t textVA,
+                                            const struct mach_header *mh, intptr_t slide,
+                                            void **guardOut, void **modeOut) {
+    void *firstGuard = NULL, *firstMode = NULL;
+    for (uint64_t i = 0; i + 24 < count; i++) {
+        if (!lcIsLdarb(text[i]) && !lcIsLdrbImm(text[i])) continue;
+
+        uint64_t tbz = 0;
+        for (uint64_t k = i + 1; k <= i + 8 && k < count; k++) {
+            if (lcIsTbz(text[k])) { tbz = k; break; }
+        }
+        if (!tbz) continue;
+
+        void *guard = lcResolveLoadTarget(text, (uint32_t)count, (uint32_t)i, textVA, lcInsnRn(text[i]));
+        if (!guard) continue;
+        if (!lcAddressWritableInImage(mh, slide, guard)) continue;
+        if (*(volatile uint64_t *)guard != 0) continue;
+
+        for (uint64_t k = tbz + 1; k <= tbz + 20 && k < count; k++) {
+            if (!lcIsLdarb(text[k]) && !lcIsLdrbImm(text[k])) continue;
+            void *mode = lcResolveLoadTarget(text, (uint32_t)count, (uint32_t)k, textVA, lcInsnRn(text[k]));
+            if (!mode || mode == guard) continue;
+            if (!lcAddressWritableInImage(mh, slide, mode)) continue;
+            if (*(volatile uint8_t *)mode > 1) continue;
+
+            uintptr_t a = (uintptr_t)guard, b = (uintptr_t)mode;
+            uintptr_t delta = a > b ? a - b : b - a;
+            if (delta > 0x10000) continue;
+
+            if (!firstGuard) {
+                firstGuard = guard;
+                firstMode = mode;
+            } else if (firstGuard == guard && firstMode == mode) {
+                *guardOut = guard;
+                *modeOut = mode;
+                return true;
+            }
+            break;
+        }
+    }
+    return false;
+}
+
 // Walk __text for the lazy-init + mode-check shape above. Two functions must
 // resolve to the same pair of globals before anything is written.
 // A launch has a finite budget for this walk: every guest image is scanned,
@@ -560,7 +610,7 @@ static bool lcFindAllocatorModeGlobals(const struct mach_header *mh, intptr_t sl
         *modeOut = tightMode;
         return true;
     }
-    return false;
+    return lcFindAllocatorModeGlobalsLoose(text, count, textVA, mh, slide, guardOut, modeOut);
 }
 
 static void LCForceLegacyAllocatorMode(const struct mach_header *mh, intptr_t slide) {
