@@ -58,12 +58,50 @@ static void LCGuardedZoneFree(malloc_zone_t *zone, void *p) {
 // guest on the legacy code path of whatever it is gating (allocator format,
 // OS feature gates), which is the path that runs on older iOS versions and
 // is therefore the battle-tested one.
+#pragma pack(push, 4)
+typedef struct {
+    uint32_t platform;
+    uint32_t version;
+} lc_dyld_build_version_t;
+#pragma pack(pop)
+
 static int LCLegacyAvailabilityCheck(uint32_t count, void *args) {
-    return 0;
+    if (args && count > 0) {
+        const lc_dyld_build_version_t *v = (const lc_dyld_build_version_t *)args;
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t major = v[i].version >> 16;
+            if (major >= 17) {
+                return 0; // Cap guest images at iOS 16 so legacy allocators remain active
+            }
+        }
+    }
+    typedef int (*real_avc_t)(uint32_t, const void *);
+    static real_avc_t real_avc = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        real_avc = (real_avc_t)dlsym(RTLD_DEFAULT, "availability_version_check");
+        if (!real_avc) real_avc = (real_avc_t)dlsym(RTLD_DEFAULT, "_availability_version_check");
+    });
+    if (real_avc && real_avc != (real_avc_t)LCLegacyAvailabilityCheck) {
+        return real_avc(count, args);
+    }
+    return 1;
 }
 
 static int LCLegacyPlatformVersionCheck(uint32_t platform, uint32_t major, uint32_t minor, uint32_t subminor) {
-    if (major >= 16) return 0;
+    if (major >= 17) {
+        return 0; // Cap guest images at iOS 16
+    }
+    typedef int (*real_pvac_t)(uint32_t, uint32_t, uint32_t, uint32_t);
+    static real_pvac_t real_pvac = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        real_pvac = (real_pvac_t)dlsym(RTLD_DEFAULT, "__isPlatformVersionAtLeast");
+        if (!real_pvac) real_pvac = (real_pvac_t)dlsym(RTLD_DEFAULT, "___isPlatformVersionAtLeast");
+    });
+    if (real_pvac && real_pvac != (real_pvac_t)LCLegacyPlatformVersionCheck) {
+        return real_pvac(platform, major, minor, subminor);
+    }
     return 1;
 }
 

@@ -287,12 +287,50 @@ static void *getAppEntryPoint(void *handle) {
 //     function-prologue signatures), so the fix does not depend on the
 //     availability path at all.
 
+#pragma pack(push, 4)
+typedef struct {
+    uint32_t platform;
+    uint32_t version;
+} lc_dyld_build_version_t;
+#pragma pack(pop)
+
 static int LCLegacyAvailabilityCheck(uint32_t count, void *versions) {
-    return 0;
+    if (versions && count > 0) {
+        const lc_dyld_build_version_t *v = (const lc_dyld_build_version_t *)versions;
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t major = v[i].version >> 16;
+            if (major >= 17) {
+                return 0; // Cap guest images at iOS 16 so legacy allocators remain active
+            }
+        }
+    }
+    typedef int (*real_avc_t)(uint32_t, const void *);
+    static real_avc_t real_avc = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        real_avc = (real_avc_t)dlsym(RTLD_DEFAULT, "availability_version_check");
+        if (!real_avc) real_avc = (real_avc_t)dlsym(RTLD_DEFAULT, "_availability_version_check");
+    });
+    if (real_avc && real_avc != (real_avc_t)LCLegacyAvailabilityCheck) {
+        return real_avc(count, versions);
+    }
+    return 1;
 }
 
 static int LCLegacyPlatformVersionCheck(uint32_t platform, uint32_t major, uint32_t minor, uint32_t subminor) {
-    if (major >= 16) return 0;
+    if (major >= 17) {
+        return 0; // Cap guest images at iOS 16 so legacy plain malloc/free mode is selected
+    }
+    typedef int (*real_pvac_t)(uint32_t, uint32_t, uint32_t, uint32_t);
+    static real_pvac_t real_pvac = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        real_pvac = (real_pvac_t)dlsym(RTLD_DEFAULT, "__isPlatformVersionAtLeast");
+        if (!real_pvac) real_pvac = (real_pvac_t)dlsym(RTLD_DEFAULT, "___isPlatformVersionAtLeast");
+    });
+    if (real_pvac && real_pvac != (real_pvac_t)LCLegacyPlatformVersionCheck) {
+        return real_pvac(platform, major, minor, subminor);
+    }
     return 1;
 }
 
@@ -359,60 +397,6 @@ void LCOverwriteGotSlotsInImage(const struct mach_header *mh, intptr_t slide,
     }
 }
 
-// Belt-and-suspenders backup pinned to the exact game binary from crash
-// reports #2-#6. Disassembly of blackrussia-client:
-#define LC_BR_UUID_HEX "855846c34f723770b811dd7fbe68b0db"
-static const uint8_t LC_BR_Znwm_SIG[16] = {
-    0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9,
-    0xfd, 0x43, 0x00, 0x91, 0xf3, 0x03, 0x00, 0xaa };
-static const uint8_t LC_BR_ZdlPv_SIG[16] = {
-    0xff, 0x83, 0x00, 0xd1, 0xfd, 0x7b, 0x01, 0xa9,
-    0xfd, 0x43, 0x00, 0x91, 0xc8, 0xd0, 0x00, 0xf0 };
-
-static void LCForceBlackRussiaLegacyAllocator(const struct mach_header *mh, intptr_t slide) {
-    if (mh->magic != MH_MAGIC_64) return;
-    Dl_info info;
-    if (!dladdr((const void *)mh, &info) || !info.dli_fname) return;
-    if (!strstr(info.dli_fname, "blackrussia")) return;
-
-    bool oldUuid = false;
-    const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
-    for (uint32_t i = 0; i < mh->ncmds; i++) {
-        const struct load_command *lc = (const struct load_command *)cursor;
-        if (lc->cmd == LC_UUID) {
-            static const char digits[] = "0123456789abcdef";
-            char hex[33];
-            const uint8_t *u = cursor + sizeof(struct load_command);
-            for (int b = 0; b < 16; b++) {
-                hex[b * 2] = digits[u[b] >> 4];
-                hex[b * 2 + 1] = digits[u[b] & 0xf];
-            }
-            hex[32] = '\0';
-            oldUuid = (strcmp(hex, LC_BR_UUID_HEX) == 0);
-            break;
-        }
-        cursor += lc->cmdsize;
-    }
-    if (oldUuid) {
-        if (memcmp((const void *)(uintptr_t)(slide + 0xF1200), LC_BR_Znwm_SIG, sizeof(LC_BR_Znwm_SIG)) == 0 &&
-            memcmp((const void *)(uintptr_t)(slide + 0xF1060), LC_BR_ZdlPv_SIG, sizeof(LC_BR_ZdlPv_SIG)) == 0) {
-            volatile uint64_t *guard = (volatile uint64_t *)(uintptr_t)(slide + 0x1B0C5D8);
-            volatile uint8_t *mode = (volatile uint8_t *)(uintptr_t)(slide + 0x1B0C599);
-            if (*guard == 0) {
-                kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)((uintptr_t)guard & ~0xfffULL),
-                                              0x4000, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-                if (kr == KERN_SUCCESS) {
-                    *guard = 1;
-                    *mode = 1;
-                    NSLog(@"[LC] blackrussia-client allocator mode forced to legacy malloc/free (pinned offsets)");
-                    return;
-                }
-            }
-        }
-    }
-    NSLog(@"[LC] blackrussia-client detected (%s), platform check rebind active", info.dli_fname);
-}
-
 static void LCGuardGuestImageEarly(const struct mach_header *mh, intptr_t slide) {
     Dl_info info;
     if (!dladdr((const void *)mh, &info) || !info.dli_fname) return;
@@ -426,7 +410,6 @@ static void LCGuardGuestImageEarly(const struct mach_header *mh, intptr_t slide)
     LCOverwriteGotSlotsInImage(mh, slide, "availability_version_check", (void *)LCLegacyAvailabilityCheck);
     LCOverwriteGotSlotsInImage(mh, slide, "free", (void *)LCGuardedFreeEarly);
     LCOverwriteGotSlotsInImage(mh, slide, "malloc_zone_free", (void *)LCGuardedZoneFreeEarly);
-    LCForceBlackRussiaLegacyAllocator(mh, slide);
     NSLog(@"[LC] guest image guarded pre-init: %s", path);
 }
 
@@ -434,15 +417,6 @@ static void LCInstallGuestAllocatorGuard(void) {
     static bool installed = false;
     if (installed) return;
     installed = true;
-    void *pIsPlatformVersionAtLeast = dlsym(RTLD_DEFAULT, "__isPlatformVersionAtLeast");
-    if (pIsPlatformVersionAtLeast) {
-        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, pIsPlatformVersionAtLeast, (void *)LCLegacyPlatformVersionCheck, NULL);
-    }
-    void *pAvailabilityVersionCheck = dlsym(RTLD_DEFAULT, "_availability_version_check");
-    if (!pAvailabilityVersionCheck) pAvailabilityVersionCheck = dlsym(RTLD_DEFAULT, "availability_version_check");
-    if (pAvailabilityVersionCheck) {
-        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, pAvailabilityVersionCheck, (void *)LCLegacyAvailabilityCheck, NULL);
-    }
     // Fires immediately for all images loaded so far (LC's own - filtered out
     // by path) and for every image added later, before its initializers run.
     _dyld_register_func_for_add_image(LCGuardGuestImageEarly);
