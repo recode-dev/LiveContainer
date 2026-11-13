@@ -58,51 +58,8 @@ static void LCGuardedZoneFree(malloc_zone_t *zone, void *p) {
 // guest on the legacy code path of whatever it is gating (allocator format,
 // OS feature gates), which is the path that runs on older iOS versions and
 // is therefore the battle-tested one.
-#pragma pack(push, 4)
-typedef struct {
-    uint32_t platform;
-    uint32_t version;
-} lc_dyld_build_version_t;
-#pragma pack(pop)
-
 static int LCLegacyAvailabilityCheck(uint32_t count, void *args) {
-    if (args && count > 0) {
-        const lc_dyld_build_version_t *v = (const lc_dyld_build_version_t *)args;
-        for (uint32_t i = 0; i < count; i++) {
-            uint32_t major = v[i].version >> 16;
-            if (major >= 17) {
-                return 0; // Cap guest images at iOS 16 so legacy allocators remain active
-            }
-        }
-    }
-    typedef int (*real_avc_t)(uint32_t, const void *);
-    static real_avc_t real_avc = NULL;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        real_avc = (real_avc_t)dlsym(RTLD_DEFAULT, "availability_version_check");
-        if (!real_avc) real_avc = (real_avc_t)dlsym(RTLD_DEFAULT, "_availability_version_check");
-    });
-    if (real_avc && real_avc != (real_avc_t)LCLegacyAvailabilityCheck) {
-        return real_avc(count, args);
-    }
-    return 1;
-}
-
-static int LCLegacyPlatformVersionCheck(uint32_t platform, uint32_t major, uint32_t minor, uint32_t subminor) {
-    if (major >= 17) {
-        return 0; // Cap guest images at iOS 16
-    }
-    typedef int (*real_pvac_t)(uint32_t, uint32_t, uint32_t, uint32_t);
-    static real_pvac_t real_pvac = NULL;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        real_pvac = (real_pvac_t)dlsym(RTLD_DEFAULT, "__isPlatformVersionAtLeast");
-        if (!real_pvac) real_pvac = (real_pvac_t)dlsym(RTLD_DEFAULT, "___isPlatformVersionAtLeast");
-    });
-    if (real_pvac && real_pvac != (real_pvac_t)LCLegacyPlatformVersionCheck) {
-        return real_pvac(platform, major, minor, subminor);
-    }
-    return 1;
+    return 0;
 }
 
 // Duplicated from LCBootstrap.m (this is a separate image): overwrite every
@@ -114,30 +71,16 @@ static void LCOverwriteGotSlotsLocal(const struct mach_header *mh, intptr_t slid
     if (mh->magic != MH_MAGIC_64) return;
     void *target = dlsym(RTLD_DEFAULT, symbolName);
     if (!target) return;
-    uintptr_t targetClean = (uintptr_t)target & 0x7FFFFFFFFFFFULL;
     const uint8_t *cursor = (const uint8_t *)mh + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < mh->ncmds; i++) {
         const struct load_command *lc = (const struct load_command *)cursor;
         if (lc->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *seg = (const struct segment_command_64 *)cursor;
-            if (strcmp(seg->segname, "__DATA") != 0 &&
-                strcmp(seg->segname, "__DATA_CONST") != 0 &&
-                strcmp(seg->segname, "__AUTH") != 0 &&
-                strcmp(seg->segname, "__AUTH_CONST") != 0) {
-                cursor += lc->cmdsize;
-                continue;
-            }
             const struct section_64 *sections = (const struct section_64 *)(cursor + sizeof(struct segment_command_64));
             for (uint32_t s = 0; s < seg->nsects; s++) {
                 const struct section_64 *sect = &sections[s];
                 uint8_t type = sect->flags & SECTION_TYPE;
-                bool isGot = (type == S_NON_LAZY_SYMBOL_POINTERS ||
-                              type == S_LAZY_SYMBOL_POINTERS ||
-                              strncmp(sect->sectname, "__got", 5) == 0 ||
-                              strncmp(sect->sectname, "__auth_got", 10) == 0 ||
-                              strncmp(sect->sectname, "__nl_symbol_ptr", 15) == 0 ||
-                              strncmp(sect->sectname, "__la_symbol_ptr", 15) == 0);
-                if (!isGot) continue;
+                if (type != S_NON_LAZY_SYMBOL_POINTERS && type != S_LAZY_SYMBOL_POINTERS) continue;
                 if (sect->size == 0 || sect->size > 0x100000) continue;
                 void **slots = (void **)(uintptr_t)(sect->addr + slide);
                 kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)(uintptr_t)slots,
@@ -145,8 +88,7 @@ static void LCOverwriteGotSlotsLocal(const struct mach_header *mh, intptr_t slid
                                               VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
                 if (kr != KERN_SUCCESS) continue;
                 for (uintptr_t k = 0; k < sect->size / sizeof(void *); k++) {
-                    uintptr_t slotClean = (uintptr_t)slots[k] & 0x7FFFFFFFFFFFULL;
-                    if (slotClean == targetClean || slots[k] == target) {
+                    if (slots[k] == target) {
                         slots[k] = replacement;
                     }
                 }
@@ -167,17 +109,11 @@ static void LCGuardGuestImages(const struct mach_header *mh, intptr_t slide) {
         { "free", (void *)LCGuardedFree, NULL },
         { "malloc_zone_free", (void *)LCGuardedZoneFree, NULL },
         { "availability_version_check", (void *)LCLegacyAvailabilityCheck, NULL },
-        { "_availability_version_check", (void *)LCLegacyAvailabilityCheck, NULL },
-        { "__isPlatformVersionAtLeast", (void *)LCLegacyPlatformVersionCheck, NULL },
-        { "___isPlatformVersionAtLeast", (void *)LCLegacyPlatformVersionCheck, NULL },
     };
     rebind_symbols_image((void *)mh, slide, rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
     // Chained-fixups images (all modern apps/tweaks) have empty indirect
     // symbol tables and the fishhook pass above no-ops for them; patch by
     // resolved value instead. Idempotent with LCBootstrap.m's pre-init pass.
-    LCOverwriteGotSlotsLocal(mh, slide, "__isPlatformVersionAtLeast", (void *)LCLegacyPlatformVersionCheck);
-    LCOverwriteGotSlotsLocal(mh, slide, "___isPlatformVersionAtLeast", (void *)LCLegacyPlatformVersionCheck);
-    LCOverwriteGotSlotsLocal(mh, slide, "_availability_version_check", (void *)LCLegacyAvailabilityCheck);
     LCOverwriteGotSlotsLocal(mh, slide, "availability_version_check", (void *)LCLegacyAvailabilityCheck);
     LCOverwriteGotSlotsLocal(mh, slide, "free", (void *)LCGuardedFree);
     LCOverwriteGotSlotsLocal(mh, slide, "malloc_zone_free", (void *)LCGuardedZoneFree);
